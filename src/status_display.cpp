@@ -121,6 +121,26 @@ static void drawHeader(const PortalStatus &s) {
   cv->setCursor(M + 4 + ox, 48 + oy);
   cv->print("ESP32-PORTAL");
 
+  // Battery indicator between the title and the status pill
+  if (s.battery >= 0) {
+    const int bw = 28, bh = 15;
+    int bx0 = 168 + ox, by0 = 36 + oy;
+    uint16_t bcol = s.charging ? COL_ONLINE : (s.battery <= 15 ? COL_OFFLINE : COL_TEXT);
+    cv->drawRoundRect(bx0, by0, bw, bh, 3, COL_MUTED);
+    cv->fillRect(bx0 + bw, by0 + 4, 3, bh - 8, COL_MUTED);           // terminal
+    int fill = (bw - 4) * constrain(s.battery, 0, 100) / 100;
+    if (fill > 0) cv->fillRect(bx0 + 2, by0 + 2, fill, bh - 4, bcol);
+    if (s.charging) {                                                // small bolt
+      int cx = bx0 + bw / 2, cy = by0 + bh / 2;
+      cv->fillTriangle(cx + 2, cy - 6, cx - 4, cy + 1, cx + 1, cy + 1, COL_BG);
+      cv->fillTriangle(cx - 2, cy + 6, cx + 4, cy - 1, cx - 1, cy - 1, COL_BG);
+    }
+    cv->setFont(u8g2_font_helvB10_tf);
+    cv->setTextColor(bcol);
+    cv->setCursor(bx0 + bw + 7, by0 + 13);
+    cv->print(String(s.battery) + "%");
+  }
+
   const char *txt = s.online ? "ONLINE" : "OFFLINE";
   uint16_t col = s.online ? COL_ONLINE : COL_OFFLINE;
   int16_t bx, by;
@@ -332,7 +352,8 @@ void displayUpdate(const PortalStatus &s) {
 
   bool changed = !drawn || s.online != last.online || s.ssid != last.ssid ||
                  s.open != last.open || s.clients != last.clients || s.ip != last.ip ||
-                 s.survey != last.survey || s.votes != last.votes || s.summary != last.summary;
+                 s.survey != last.survey || s.votes != last.votes || s.summary != last.summary ||
+                 s.battery != last.battery || s.charging != last.charging;
   if (!changed) return;
   render(s);
   last = s;

@@ -93,7 +93,19 @@ Each answer is stored as one line in `/responses.csv` on the board:
 - The survey page says "Your answer is stored anonymously". Tell your visitors what you use the answers for,
   and follow the privacy rules (e.g. GDPR) that apply to you.
 
-## 6. Other ways to change settings
+## 6. Battery (optional)
+
+The board can run on a single-cell 3.7 V LiPo on the **MX1.25** battery connector; it charges
+over USB-C via the on-board AXP2101. The display shows the battery level (with a bolt while charging),
+and the app shows it on the WiFi tab.
+
+- **Check the polarity** before plugging in: small LiPo cells often come with red/black swapped
+  compared to the board's **+ / −** marking. With reversed polarity the board sees 0 V.
+- Charge current is 200 mA by default (fine for 200–400 mAh cells). For a bigger battery set
+  `#define BATTERY_CHARGE_MA 400` in `config_local.h`.
+- The USB command `PMU` reports battery voltage, percentage and charger state for troubleshooting.
+
+## 7. Other ways to change settings
 
 - **Touch display:** tap the network card to switch the network on or off.
 - **Web page:** `http://192.168.4.1/settings` (only when you set `ADMIN_PASSWORD` in `config_local.h`;
@@ -113,6 +125,7 @@ Each answer is stored as one line in `/responses.csv` on the board:
 | `src/main.cpp` | Access point, DNS redirect, web server, USB protocol |
 | `src/status_display.cpp` | AMOLED status screen and touch |
 | `src/survey.cpp` | Survey answers, log, one-vote-per-device |
+| `src/power.cpp` | AXP2101 battery charging and measurements |
 | `data/` | Default landing page |
 | `admin/` | Portal Admin app (Python/Tkinter) |
 | `build_exe.bat` | Builds `Portal Admin.exe` with PyInstaller |
@@ -123,7 +136,8 @@ Line-based over the serial port (115200 baud); replies start with `@`. Text is h
 
 | Command | Reply |
 |---|---|
-| `INFO` | `@INFO ssid=<hex> open=<0/1> clients=<n> ip=<ip> fw=<version> lcd=<SH8601/CO5300/none> ap=<0/1>` |
+| `INFO` | `@INFO ssid=<hex> open=<0/1> clients=<n> ip=<ip> fw=<version> lcd=<SH8601/CO5300/none> ap=<0/1> bat=<0-100/-1> chg=<0/1>` |
+| `PMU` | Battery and charger status (voltage, percentage, charging, USB) |
 | `SET <ssid-hex> <password>` | `@OK` + restart, or `@ERR <message>`. Password: `-` = open, `=` = unchanged, otherwise hex |
 | `AP 1` / `AP 0` | Network on/off (kept after a restart) |
 | `RESET` | `@OK` + factory reset and restart |

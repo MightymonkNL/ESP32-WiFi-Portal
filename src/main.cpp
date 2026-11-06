@@ -22,6 +22,7 @@
 #include "config.h"
 #include "status_display.h"
 #include "survey.h"
+#include "power.h"
 
 static const byte DNS_PORT = 53;
 static const IPAddress apIP(AP_IP);
@@ -523,16 +524,23 @@ static void handleSerialCommand(String line) {
   if (handleFileCommand(line)) return;
 
   if (line == "INFO") {
-    Serial.printf("@INFO ssid=%s open=%d clients=%d ip=%s fw=%s lcd=%s ap=%d\n",
+    PowerStatus ps = pmuStatus();
+    Serial.printf("@INFO ssid=%s open=%d clients=%d ip=%s fw=%s lcd=%s ap=%d bat=%d chg=%d\n",
                   toHex(apSsid).c_str(), apPass.isEmpty() ? 1 : 0,
                   apRunning ? WiFi.softAPgetStationNum() : 0, apIP.toString().c_str(), FW_VERSION,
-                  displayDriver(), apRunning ? 1 : 0);
+                  displayDriver(), apRunning ? 1 : 0, ps.battery ? ps.percent : -1,
+                  ps.battery && ps.charging ? 1 : 0);
     return;
   }
 
   if (line == "AP 1" || line == "AP 0") {
     setApEnabled(line == "AP 1");
     Serial.println("@OK");
+    return;
+  }
+
+  if (line == "PMU") {
+    Serial.println("@PMU " + pmuReport(pmuStatus()) + " | boot: " + pmuBootReport());
     return;
   }
 
@@ -628,6 +636,7 @@ void setup() {
   }
 
   displayBegin();
+  pmuBegin();
 }
 
 static void updateDisplay(bool force = false) {
@@ -647,6 +656,15 @@ static void updateDisplay(bool force = false) {
   s.votes = surveyVotes();
   s.average = surveyAverage();
   s.summary = surveySummary();
+  // Battery: read every 5 s (enough for a slowly changing value)
+  static unsigned long lastPmu = 0;
+  static PowerStatus ps = {false, -1, 0, false, false, 0, 0, "n/a"};
+  if (lastPmu == 0 || millis() - lastPmu > 5000) {
+    lastPmu = millis();
+    ps = pmuStatus();
+  }
+  s.battery = ps.battery ? ps.percent : -1;
+  s.charging = ps.battery && ps.charging;
   displayUpdate(s);
 }
 

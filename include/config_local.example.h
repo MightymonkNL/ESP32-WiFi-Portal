@@ -12,5 +12,8 @@
 #define ADMIN_USER     "admin"
 #define ADMIN_PASSWORD "choose-a-strong-password"
 
+// Battery charge current in mA (100/200/300/400); keep it at or below the battery capacity
+// #define BATTERY_CHARGE_MA 200
+
 // Display brightness 0-255
 // #define DISPLAY_BRIGHTNESS 170

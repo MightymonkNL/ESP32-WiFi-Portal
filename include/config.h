@@ -1,6 +1,6 @@
 #pragma once
 
-#define FW_VERSION "1.9"
+#define FW_VERSION "2.0"
 
 // Personal settings go in include/config_local.h (not in git).
 // Copy include/config_local.example.h to include/config_local.h and edit it.

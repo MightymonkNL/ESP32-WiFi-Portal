@@ -775,7 +775,17 @@ class App(tk.Tk):
         self._toggle_pass()
         self.info_var.set(f"IP {info.get('ip', '?')}  ·  {info.get('clients', '0')} connected device(s)"
                           f"  ·  firmware {info.get('fw', '?')}"
-                          + (f"  ·  display {info['lcd']}" if "lcd" in info else ""))
+                          + (f"  ·  display {info['lcd']}" if "lcd" in info else "")
+                          + self._battery_text(info))
+
+    @staticmethod
+    def _battery_text(info):
+        bat = info.get("bat")
+        if bat is None:
+            return ""
+        if bat == "-1":
+            return "  ·  no battery"
+        return f"  ·  battery {bat}%" + (" (charging)" if info.get("chg") == "1" else "")
 
     def refresh_ports(self):
         ports = find_ports()

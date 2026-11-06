@@ -13,6 +13,8 @@ struct PortalStatus {
   int votes;
   float average;      // stars
   String summary;     // e.g. "Yes 12  No 5"
+  int battery;        // 0-100, -1 = no battery
+  bool charging;
 };
 
 // Initialiseert het scherm. Geeft false terug als er geen scherm gevonden is.
