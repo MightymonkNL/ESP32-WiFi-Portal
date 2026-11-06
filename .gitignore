@@ -1,0 +1,15 @@
+# Build output
+.pio/
+.vscode/
+build/
+dist/
+*.spec
+__pycache__/
+
+# Built admin app: publish it as a GitHub Release instead of committing it
+Portal Admin.exe
+
+# Personal settings and content (stay on your own machine)
+include/config_local.h
+admin/portal_content.json
+admin/portal_assets/
