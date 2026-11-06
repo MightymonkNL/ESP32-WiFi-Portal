@@ -1,6 +1,6 @@
 #pragma once
 
-#define FW_VERSION "2.0"
+#define FW_VERSION "2.1"
 
 // Personal settings go in include/config_local.h (not in git).
 // Copy include/config_local.example.h to include/config_local.h and edit it.
@@ -57,4 +57,13 @@
 #define IIC_SCL     14
 #ifndef DISPLAY_BRIGHTNESS
 #define DISPLAY_BRIGHTNESS 170   // 0-255; lower = less AMOLED burn-in
+#endif
+
+// Battery mode: on battery (no USB) the display dims; a short press on the
+// PWR button wakes it to full brightness for WAKE_SECONDS.
+#ifndef DIM_BRIGHTNESS
+#define DIM_BRIGHTNESS 15
+#endif
+#ifndef WAKE_SECONDS
+#define WAKE_SECONDS 10
 #endif

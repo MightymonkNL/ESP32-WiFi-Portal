@@ -104,6 +104,9 @@ and the app shows it on the WiFi tab.
 - Charge current is 200 mA by default (fine for 200–400 mAh cells). For a bigger battery set
   `#define BATTERY_CHARGE_MA 400` in `config_local.h`.
 - The USB command `PMU` reports battery voltage, percentage and charger state for troubleshooting.
+- **Battery mode:** without USB power the display dims (`DIM_BRIGHTNESS`, default 15). A short press on
+  the **PWR** button lights it up for `WAKE_SECONDS` (default 10). Holding PWR for about 6 seconds
+  switches the board off (hardware); a short press switches it on again.
 
 ## 7. Other ways to change settings
 

@@ -30,5 +30,8 @@ bool displayPollTap();
 // Laatste aanraking (voor diagnose via USB): x, y en aantal vingers.
 void displayLastTouch(int &x, int &y, int &fingers, unsigned long &ageMs);
 
+// Sets the panel brightness (0-255); only sends a command when it changes.
+void displaySetBrightness(uint8_t level);
+
 // Tekent alleen wat er veranderd is; veilig om vaak aan te roepen.
 void displayUpdate(const PortalStatus &s);

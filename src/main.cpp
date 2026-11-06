@@ -639,6 +639,8 @@ void setup() {
   pmuBegin();
 }
 
+static PowerStatus powerNow = {false, -1, 0, false, false, 0, 0, "n/a"};
+
 static void updateDisplay(bool force = false) {
   static unsigned long lastUpdate = 0;
   if (!force && millis() - lastUpdate < 500) return;
@@ -656,16 +658,25 @@ static void updateDisplay(bool force = false) {
   s.votes = surveyVotes();
   s.average = surveyAverage();
   s.summary = surveySummary();
-  // Battery: read every 5 s (enough for a slowly changing value)
-  static unsigned long lastPmu = 0;
-  static PowerStatus ps = {false, -1, 0, false, false, 0, 0, "n/a"};
-  if (lastPmu == 0 || millis() - lastPmu > 5000) {
-    lastPmu = millis();
-    ps = pmuStatus();
-  }
-  s.battery = ps.battery ? ps.percent : -1;
-  s.charging = ps.battery && ps.charging;
+  s.battery = powerNow.battery ? powerNow.percent : -1;
+  s.charging = powerNow.battery && powerNow.charging;
   displayUpdate(s);
+}
+
+// Battery mode: dim the display when running on battery; the PWR button
+// wakes it to full brightness for WAKE_SECONDS.
+static void updatePower() {
+  static unsigned long lastPmu = 0;
+  static unsigned long wakeUntil = 0;
+  if (lastPmu == 0 || millis() - lastPmu > 2000) {   // power source / battery every 2 s
+    lastPmu = millis();
+    powerNow = pmuStatus();
+  }
+  if (pmuButtonPressed()) wakeUntil = millis() + WAKE_SECONDS * 1000UL;
+
+  bool onBattery = powerNow.battery && !powerNow.usb;
+  bool awake = (long)(wakeUntil - millis()) > 0;
+  displaySetBrightness(onBattery && !awake ? DIM_BRIGHTNESS : DISPLAY_BRIGHTNESS);
 }
 
 void loop() {
@@ -675,6 +686,7 @@ void loop() {
   }
   checkResetButton();
   pollSerial();
+  updatePower();
   if (displayPollTap()) {          // tik op de netwerkkaart = netwerk aan/uit
     setApEnabled(!apEnabled);
     updateDisplay(true);

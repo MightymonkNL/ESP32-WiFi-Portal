@@ -17,3 +17,7 @@
 
 // Display brightness 0-255
 // #define DISPLAY_BRIGHTNESS 170
+
+// Battery mode: brightness without USB power, and how long the PWR button lights it up
+// #define DIM_BRIGHTNESS 15
+// #define WAKE_SECONDS 10

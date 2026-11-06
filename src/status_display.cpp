@@ -303,6 +303,14 @@ bool displayPollTap() {
 
 // ---------------------------------------------------------------- API
 
+static int currentBrightness = -1;
+
+void displaySetBrightness(uint8_t level) {
+  if (!panel || !cv || level == currentBrightness) return;
+  panel->setBrightness(level);
+  currentBrightness = level;
+}
+
 bool displayBegin() {
   Wire.begin(IIC_SDA, IIC_SCL);
   resetViaExpander();
@@ -332,6 +340,7 @@ bool displayBegin() {
   cv->fillScreen(COL_BG);
   cv->flush(true);
   panel->setBrightness(DISPLAY_BRIGHTNESS);
+  currentBrightness = DISPLAY_BRIGHTNESS;
   lastShift = millis();
   Serial.println("[LCD] display active");
   return true;

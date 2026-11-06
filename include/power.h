@@ -25,6 +25,10 @@ struct PowerStatus {
 
 PowerStatus pmuStatus();
 
+// True once per short press of the PWR button (AXP2101 power key or IO expander EXIO4).
+// Call often (e.g. every loop); it polls at most every 50 ms.
+bool pmuButtonPressed();
+
 // One-line diagnostic text (for the USB command PMU)
 String pmuReport(const PowerStatus &s);
 // The same report taken at boot, before this firmware changed any settings
