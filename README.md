@@ -5,7 +5,10 @@ A WiFi access point with a captive landing page and an optional mini-survey, for
 
 When someone joins the network, their phone or laptop opens the landing page automatically
 (if not, they can browse to `http://192.168.4.1`). You manage everything from your laptop over
-USB-C with the **Portal Admin** app: network name, landing page (text, image, colours), survey and results.
+USB-C with the **ESP32 Toolbox** app: network name, landing page (text, image, colours), survey and results.
+
+The Toolbox handles more than this portal: every project is a **module**, and the Toolbox can install
+another project on the board (and back) without losing settings. See [section 4](#4-esp32-toolbox).
 
 **Features**
 
@@ -70,10 +73,47 @@ If uploading fails, put the board in download mode: hold **BOOT**, press **RESET
 > `uploadfs` overwrites everything on the board's file system, including a page and survey
 > uploaded from the app. Upload them again from the app afterwards.
 
-## 4. Portal Admin app
+## 4. ESP32 Toolbox
 
-Start it with **`Portal Admin.exe`** (see *Releases*), or from source with `admin\Portal Admin.bat`
+Start it with **`ESP32 Toolbox.exe`**, or from source with `admin\ESP32 Toolbox.bat`
 (needs Python 3 + pyserial). Close the PlatformIO serial monitor first: only one program can use the COM port.
+
+The Toolbox starts with the **projects**: one card per project, and at the top which project runs
+on the connected ESP32 (marked **On the ESP32** on its card). Click a card to open the project;
+**← Projects** goes back. The projects are loose folders in `admin/modules` next to the exe, so a
+new project needs no new exe.
+
+| Module | Project |
+|---|---|
+| **WiFi Portal** (`modules/portal`) | This portal (firmware in the repository root) |
+| **Empty project** (`modules/template`) | Placeholder to start a new project from (`projects/template`) |
+
+### Installing a project (Firmware tab)
+
+Every project has a **Firmware** tab: the version on the ESP32 and in the Toolbox, the install or
+update button and the backups of that project for this board. When you open a project that does not
+run on the ESP32, an orange bar says what runs there instead, with an **Install** button; you can
+still prepare the project (for example portal pages), but actions that need the board are off until
+it is installed. Installing:
+
+1. backs up the project on the board to `admin/backups/<board>/<project>-<time>.zip`
+   (the last 5 per project and board are kept);
+2. flashes the new project with esptool (about a minute);
+3. puts the last settings of that project back, when there is a backup of it for this board.
+
+Only the program itself is written: the WiFi settings and files of the other project stay on the
+board as long as both projects use the same partition table, so switching back is quick and complete.
+When another project did erase them, step 3 restores them from the backup. **Update to x.y** appears
+when the project has newer firmware than the board; **Restore selected** puts an older backup back.
+
+Before the first install, build the firmware of all modules: `build_exe.bat` (or
+`python admin\build_modules.py`) puts it in `admin/modules/<id>/firmware` and copies esptool to
+`admin/tools`. To add your own project, see [admin/modules/README.md](admin/modules/README.md).
+
+The backups contain WiFi passwords and survey answers: they stay on this PC (`admin/backups` is
+ignored by git).
+
+### WiFi Portal module
 
 | Tab | What you can do |
 |---|---|
@@ -105,8 +145,8 @@ column. Needs firmware 2.4 or newer.
 password, network on/off), the active portal and all survey answers. Use it before you install
 another program on the ESP32: that usually erases the board's storage.
 
-To get everything back: flash this firmware again (section 3), start Portal Admin and click
-**Restore backup**. The portals go back on this PC and on the board, the board restarts with the
+To get everything back: install the WiFi Portal again (**Install project…** does this automatically),
+or flash it yourself (section 3), and click **Restore backup**. The portals go back on this PC and on the board, the board restarts with the
 WiFi settings from the backup, and the answers from the backup are added to any answers already on
 the board. Devices that answered before can answer once more after a reinstall (the board's secret
 for recognising devices is new).
@@ -142,10 +182,10 @@ changes that were not uploaded yet, the app asks which version to keep and saves
 
 Survey answers, voter keys and the app settings on the board can only be read over USB, not over WiFi.
 
-Your editor content is stored locally in `admin/portal_content.json` and `admin/portal_assets/`
-(both ignored by git).
+Your editor content is stored locally in `admin/data/portal/` (ignored by git). Content of the
+old Portal Admin app (`admin/portal_content.json`, `admin/portal_assets/`) is moved there on the first start.
 
-To build the exe yourself, run `build_exe.bat`.
+To build the exe yourself, run `build_exe.bat` (needs Python 3 and PlatformIO).
 
 ## 5. Survey and privacy
 
@@ -193,21 +233,31 @@ and the app shows it on the WiFi tab.
 | `platformio.ini` | Board and build settings |
 | `include/config.h` | Defaults: network, admin login, display pins |
 | `include/config_local.example.h` | Template for your own settings |
-| `src/main.cpp` | Access point, DNS redirect, web server, USB protocol |
+| `src/main.cpp` | Access point, DNS redirect, web server, portal USB commands |
 | `src/status_display.cpp` | AMOLED status screen and touch |
 | `src/survey.cpp` | Survey answers, log, one-vote-per-device |
 | `src/power.cpp` | AXP2101 battery charging and measurements |
 | `data/` | Default landing page |
-| `admin/` | Portal Admin app (Python/Tkinter) |
-| `build_exe.bat` | Builds `Portal Admin.exe` with PyInstaller |
+| `lib/BoardLink/` | Shared USB protocol of all Toolbox projects (INFO, files) |
+| `projects/template/` | Empty project to start a new one from |
+| `admin/toolbox.pyw`, `admin/espcore.py` | ESP32 Toolbox app (Python/Tkinter) and its shared code |
+| `admin/modules/` | One folder per project: `module.json`, `module.py`, `firmware/` |
+| `admin/build_modules.py` | Builds every module's firmware into its `firmware/` folder |
+| `build_exe.bat` | Builds the firmware and `ESP32 Toolbox.exe` |
 
 ### USB protocol
 
 Line-based over the serial port (115200 baud); replies start with `@`. Text is hex-encoded (UTF-8).
+`INFO`, `REBOOT` and the file commands come from the shared BoardLink library (every Toolbox project
+has them); the others are the portal's own.
 
 | Command | Reply |
 |---|---|
-| `INFO` | `@INFO ssid=<hex> open=<0/1> clients=<n> ip=<ip> fw=<version> lcd=<SH8601/CO5300/none> ap=<0/1> bat=<0-100/-1> chg=<0/1>` |
+| `INFO` | `@INFO app=portal fw=<version> mac=<mac> ssid=<hex> open=<0/1> clients=<n> ip=<ip> lcd=<SH8601/CO5300/none> ap=<0/1> bat=<0-100/-1> chg=<0/1> portal=<id> essid=<hex> txp=<25-100>` |
+| `REBOOT` | `@OK` + restart |
+| `FLIST` | `@FLIST <name>:<size> ...` |
+| `PORTAL <id>` | Activate a portal |
+| `WIFI` | `@WIFI ssid=<hex> pass=<hex> ap=<0/1>` (for the backup) |
 | `PMU` | Battery and charger status (voltage, percentage, charging, USB) |
 | `SET <ssid-hex> <password>` | `@OK` + restart, or `@ERR <message>`. Password: `-` = open, `=` = unchanged, otherwise hex |
 | `AP 1` / `AP 0` | Network on/off (kept after a restart) |
@@ -227,6 +277,8 @@ Line-based over the serial port (115200 baud); replies start with `@`. Text is h
 | Network visible but no page | Upload a page from the app, or run `uploadfs` |
 | Sign-in window doesn't open | Browse to `http://192.168.4.1` |
 | App says "Cannot open the port" | Close the PlatformIO serial monitor or other serial programs |
+| "Firmware not built yet" in Install project | Run `build_exe.bat` or `python admin\build_modules.py` |
+| Board not recognised / installing fails | Download mode (hold BOOT, press RESET, release BOOT), then **Install project…** again |
 | Windows warns when starting the exe | The exe is not code-signed: *More info → Run anyway* |
 
 ## License

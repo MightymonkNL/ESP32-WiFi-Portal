@@ -8,9 +8,16 @@ __pycache__/
 
 # Built admin app: publish it as a GitHub Release instead of committing it
 Portal Admin.exe
+ESP32 Toolbox.exe
 
 # Personal settings and content (stay on your own machine)
 include/config_local.h
 admin/portal_content.json
 admin/portal_content.backup.json
 admin/portal_assets/
+admin/data/
+admin/backups/
+
+# Built by build_modules.py
+admin/tools/
+admin/modules/*/firmware/

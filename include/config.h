@@ -1,6 +1,8 @@
 #pragma once
 
-#define FW_VERSION "2.6"
+#define FW_VERSION "2.7"
+// Project id for the ESP32 Toolbox app (must match admin/modules/portal/module.json)
+#define APP_ID "portal"
 
 // Personal settings go in include/config_local.h (not in git).
 // Copy include/config_local.example.h to include/config_local.h and edit it.

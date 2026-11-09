@@ -1,16 +1,20 @@
 @echo off
-rem Builds "Portal Admin.exe" in this folder from admin\portal_admin.pyw.
-rem Run again after changing the admin app. Requires Python 3.
+rem Builds the firmware of all modules (admin\modules\*\firmware) and
+rem "ESP32 Toolbox.exe" in this folder. Run again after changing a project or the app.
+rem Requires Python 3 and PlatformIO.
 cd /d "%~dp0"
 python -m pip install --user --quiet pyinstaller pyserial || goto :error
+python admin\build_modules.py || goto :error
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
-  --name "Portal Admin" ^
+  --name "ESP32 Toolbox" ^
+  --paths admin ^
   --distpath "%~dp0." ^
-  --workpath "%TEMP%\portal-admin-build" ^
-  --specpath "%TEMP%\portal-admin-build" ^
-  "admin\portal_admin.pyw" || goto :error
+  --workpath "%TEMP%\esp32-toolbox-build" ^
+  --specpath "%TEMP%\esp32-toolbox-build" ^
+  "admin\toolbox.pyw" || goto :error
 echo.
-echo Done: "%~dp0Portal Admin.exe"
+echo Done: "%~dp0ESP32 Toolbox.exe"
+echo The exe uses the modules in admin\modules and esptool in admin\tools next to it.
 pause
 exit /b 0
 

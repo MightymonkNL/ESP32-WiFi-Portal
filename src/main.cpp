@@ -18,7 +18,7 @@
 #include <WebServer.h>
 #include <LittleFS.h>
 #include <Preferences.h>
-#include <mbedtls/base64.h>
+#include <BoardLink.h>
 #include "config.h"
 #include "status_display.h"
 #include "survey.h"
@@ -479,227 +479,78 @@ static void checkResetButton() {
   }
 }
 
-// ---------------------------------------------------------------- USB-beheer
+// ---------------------------------------------------------------- USB commands
 //
-// Regelgebaseerd protocol over de USB-seriële poort (115200 baud), gebruikt
-// door de laptop-app admin/portal_admin.pyw. Antwoorden beginnen met '@'
-// zodat ze te onderscheiden zijn van gewone logregels.
+// The shared BoardLink library (lib/BoardLink) handles INFO, the file commands
+// (FS, FLIST, FREAD, FBEGIN/FDATA/FEND/FABORT, FDEL) and REBOOT for the ESP32
+// Toolbox app. The portal adds these commands (replies start with '@'):
 //
-//   INFO                      -> @INFO ssid=<hex> open=<0|1> clients=<n> ip=<ip> fw=<versie>
-//   SET <ssidhex> <pass>      -> @OK (daarna herstart) of @ERR <melding>
-//                                <pass>: "-" = open netwerk, "=" = ongewijzigd,
-//                                anders het wachtwoord in hex
-//   RESET                     -> @OK (fabrieksreset, daarna herstart)
+//   SET <ssidhex> <pass>      -> @OK (then restart) or @ERR <message>
+//                                <pass>: "-" = open network, "=" = unchanged,
+//                                otherwise the password in hex
+//   RESET                     -> @OK (factory reset, then restart)
+//   AP 0 | AP 1               -> @OK: network off / on
+//   PORTAL <id>               -> @OK: activate that portal (see /portals.cfg)
+//   WIFI                      -> @WIFI ssid=<hex> pass=<hex> ap=<0|1> (for the app's backup)
+//   LOGCLEAR                  -> @OK: clear the survey log
+//   PMU, TOUCH                -> diagnostics
 //
-// Tekst wordt hex-gecodeerd (UTF-8) zodat spaties en speciale tekens geen
-// probleem geven. Toegang via USB vereist fysieke toegang tot het bordje,
-// daarom is hier geen beheerwachtwoord nodig.
+// Text is hex encoded (UTF-8) so spaces and special characters are no problem.
+// USB access needs physical access to the board, so no admin password here.
 
-//   FS                        -> @FS total=<bytes> used=<bytes>
-//   FBEGIN <pad> <grootte>    -> start upload van een bestand in de root (bijv. /index.html)
-//   FDATA <base64>            -> blok data (max. 512 bytes na decoderen)
-//   FEND                      -> @OK: bestand vervangen; @ERR bij onvolledige upload
-//   FABORT                    -> upload afbreken
-//   FDEL <pad>                -> bestand verwijderen
-//   FLIST                     -> @FLIST <naam>:<grootte> ... (bestanden in de root)
-//   PORTAL <id>               -> @OK: activeer die portal (zie /portals.cfg)
-//   WIFI                      -> @WIFI ssid=<hex> pass=<hex> ap=<0|1> (voor de backup in de app)
+using BoardLink::toHex;
+using BoardLink::fromHex;
 
-
-static const char *UPLOAD_TMP = "/.upload";
-static File upFile;
-static String upPath;
-static size_t upSize = 0, upGot = 0;
-static bool upActive = false;
-
-static bool validPath(const String &p) {
-  if (p.length() < 2 || p.length() > 31 || p[0] != '/' || p[1] == '.') return false;
-  for (size_t i = 1; i < p.length(); i++) {
-    char c = p[i];
-    if (!(isalnum((unsigned char)c) || c == '.' || c == '_' || c == '-')) return false;
-  }
-  return true;
+static String portalInfo() {
+  PowerStatus ps = pmuStatus();
+  char buf[320];
+  snprintf(buf, sizeof(buf),
+           "ssid=%s open=%d clients=%d ip=%s lcd=%s ap=%d bat=%d chg=%d portal=%s essid=%s txp=%d",
+           toHex(apSsid).c_str(), apPass.isEmpty() ? 1 : 0,
+           apRunning ? WiFi.softAPgetStationNum() : 0, apIP.toString().c_str(),
+           displayDriver(), apRunning ? 1 : 0, ps.battery ? ps.percent : -1,
+           ps.battery && ps.charging ? 1 : 0, nPortals ? portals[activePortal].id.c_str() : "-",
+           toHex(effectiveSsid()).c_str(), TX_PCT[txLevel]);
+  return buf;
 }
 
-static void abortUpload() {
-  if (upFile) upFile.close();
-  LittleFS.remove(UPLOAD_TMP);
-  upActive = false;
+static void portalFileChanged(const String &path) {
+  if (path == PORTALS_CFG) { loadPortals(); applyPortal(); }
+  else if (path == portalPath("survey.cfg")) surveyReload();
 }
 
-// Geeft true terug als het commando een bestandscommando was.
-static bool handleFileCommand(const String &line) {
-  if (line == "FS") {
-    Serial.printf("@FS total=%u used=%u\n", (unsigned)LittleFS.totalBytes(), (unsigned)LittleFS.usedBytes());
-    return true;
-  }
-  if (line.startsWith("FBEGIN ")) {
-    int sp = line.indexOf(' ', 7);
-    String path = sp > 0 ? line.substring(7, sp) : "";
-    long size = sp > 0 ? line.substring(sp + 1).toInt() : -1;
-    if (!validPath(path) || size < 0) { Serial.println("@ERR Invalid path or size"); return true; }
-    if (upActive) abortUpload();
-    size_t existing = 0;
-    if (LittleFS.exists(path)) { File f = LittleFS.open(path, "r"); existing = f.size(); f.close(); }
-    size_t freeBytes = LittleFS.totalBytes() - LittleFS.usedBytes() + existing;
-    if ((size_t)size + 16384 > freeBytes) { Serial.println("@ERR Not enough space on the board"); return true; }
-    upFile = LittleFS.open(UPLOAD_TMP, "w");
-    if (!upFile) { Serial.println("@ERR Cannot create file"); return true; }
-    upPath = path; upSize = size; upGot = 0; upActive = true;
-    Serial.println("@OK");
-    return true;
-  }
-  if (line.startsWith("FDATA ")) {
-    if (!upActive) { Serial.println("@ERR No upload in progress"); return true; }
-    static uint8_t out[600];
-    size_t olen = 0;
-    String b64 = line.substring(6);
-    if (mbedtls_base64_decode(out, sizeof(out), &olen, (const uint8_t *)b64.c_str(), b64.length()) != 0 ||
-        upGot + olen > upSize) {
-      abortUpload(); Serial.println("@ERR Invalid data"); return true;
-    }
-    if (upFile.write(out, olen) != olen) { abortUpload(); Serial.println("@ERR Write failed (storage full?)"); return true; }
-    upGot += olen;
-    Serial.println("@OK");
-    return true;
-  }
-  if (line == "FEND") {
-    if (!upActive) { Serial.println("@ERR No upload in progress"); return true; }
-    upFile.close();
-    upActive = false;
-    if (upGot != upSize) { LittleFS.remove(UPLOAD_TMP); Serial.println("@ERR Upload incomplete"); return true; }
-    LittleFS.remove(upPath);
-    if (!LittleFS.rename(UPLOAD_TMP, upPath)) { Serial.println("@ERR Save failed"); return true; }
-    Serial.printf("[FS] %s updated (%u bytes)\n", upPath.c_str(), (unsigned)upSize);
-    if (upPath == PORTALS_CFG) { loadPortals(); applyPortal(); }
-    else if (upPath == portalPath("survey.cfg")) surveyReload();
-    Serial.println("@OK");
-    return true;
-  }
-  if (line == "FABORT") { abortUpload(); Serial.println("@OK"); return true; }
-  if (line.startsWith("FDEL ")) {
-    String path = line.substring(5);
-    if (!validPath(path)) { Serial.println("@ERR Invalid path"); return true; }
-    LittleFS.remove(path);
-    if (path == PORTALS_CFG) { loadPortals(); applyPortal(); }
-    else if (path == portalPath("survey.cfg")) surveyReload();
-    Serial.println("@OK");
-    return true;
-  }
-  if (line.startsWith("FREAD ")) {
-    // FREAD <path> <offset> -> @DATA <base64, max 512 bytes> or @EOF
-    int sp = line.indexOf(' ', 6);
-    String path = sp > 0 ? line.substring(6, sp) : "";
-    long offset = sp > 0 ? line.substring(sp + 1).toInt() : -1;
-    if (!validPath(path) || offset < 0) { Serial.println("@ERR Invalid path or offset"); return true; }
-    if (!LittleFS.exists(path)) { Serial.println("@EOF"); return true; }
-    File f = LittleFS.open(path, "r");
-    if ((size_t)offset >= f.size()) { f.close(); Serial.println("@EOF"); return true; }
-    static uint8_t raw[512];
-    static unsigned char enc[700];
-    f.seek(offset);
-    size_t n = f.read(raw, sizeof(raw));
-    f.close();
-    size_t olen = 0;
-    mbedtls_base64_encode(enc, sizeof(enc), &olen, raw, n);
-    enc[olen] = 0;
-    Serial.print("@DATA ");
-    Serial.println((const char *)enc);
-    return true;
-  }
-  if (line == "FLIST") {
-    // FLIST -> @FLIST <name>:<size> ... (files in the root, without internal files)
-    String out = "@FLIST";
-    File root = LittleFS.open("/");
-    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
-      String name = f.name();
-      if (name.startsWith("/")) name = name.substring(1);
-      if (!f.isDirectory() && !name.startsWith(".")) {
-        out += ' ';
-        out += name;
-        out += ':';
-        out += String((unsigned)f.size());
-      }
-      f.close();
-    }
-    root.close();
-    Serial.println(out);
-    return true;
-  }
+static bool handlePortalCommand(const String &line) {
   if (line == "LOGCLEAR") {
     surveyClearLog();
     Serial.println("@OK");
     return true;
-  }
-  return false;
-}
-
-static String toHex(const String &s) {
-  static const char *digits = "0123456789abcdef";
-  String out;
-  out.reserve(s.length() * 2);
-  for (size_t i = 0; i < s.length(); i++) {
-    uint8_t b = (uint8_t)s[i];
-    out += digits[b >> 4];
-    out += digits[b & 0x0F];
-  }
-  return out;
-}
-
-static bool fromHex(const String &hex, String &out) {
-  if (hex.length() % 2) return false;
-  out = "";
-  for (size_t i = 0; i < hex.length(); i += 2) {
-    char buf[3] = {hex[i], hex[i + 1], 0};
-    char *end;
-    long v = strtol(buf, &end, 16);
-    if (*end != 0 || v == 0) return false;  // ongeldig of NUL-teken
-    out += (char)v;
-  }
-  return true;
-}
-
-static void handleSerialCommand(String line) {
-  line.trim();
-  if (line.isEmpty()) return;
-  if (handleFileCommand(line)) return;
-
-  if (line == "INFO") {
-    PowerStatus ps = pmuStatus();
-    Serial.printf("@INFO ssid=%s open=%d clients=%d ip=%s fw=%s lcd=%s ap=%d bat=%d chg=%d portal=%s essid=%s txp=%d\n",
-                  toHex(apSsid).c_str(), apPass.isEmpty() ? 1 : 0,
-                  apRunning ? WiFi.softAPgetStationNum() : 0, apIP.toString().c_str(), FW_VERSION,
-                  displayDriver(), apRunning ? 1 : 0, ps.battery ? ps.percent : -1,
-                  ps.battery && ps.charging ? 1 : 0, nPortals ? portals[activePortal].id.c_str() : "-",
-                  toHex(effectiveSsid()).c_str(), TX_PCT[txLevel]);
-    return;
   }
 
   if (line == "WIFI") {
     // WIFI -> @WIFI ssid=<hex> pass=<hex> ap=<0|1>  (for the app's backup; USB only)
     Serial.printf("@WIFI ssid=%s pass=%s ap=%d\n", toHex(apSsid).c_str(), toHex(apPass).c_str(),
                   apEnabled ? 1 : 0);
-    return;
+    return true;
   }
 
   if (line.startsWith("PORTAL ")) {
     // PORTAL <id> -> activate that portal (as if chosen on the display)
     String id = line.substring(7);
     for (int i = 0; i < nPortals; i++)
-      if (portals[i].id == id) { selectPortal(i); Serial.println("@OK"); return; }
+      if (portals[i].id == id) { selectPortal(i); Serial.println("@OK"); return true; }
     Serial.println("@ERR Unknown portal");
-    return;
+    return true;
   }
 
   if (line == "AP 1" || line == "AP 0") {
     setApEnabled(line == "AP 1");
     Serial.println("@OK");
-    return;
+    return true;
   }
 
   if (line == "PMU") {
     Serial.println("@PMU " + pmuReport(pmuStatus()) + " | boot: " + pmuBootReport());
-    return;
+    return true;
   }
 
   if (line == "TOUCH") {
@@ -707,7 +558,7 @@ static void handleSerialCommand(String line) {
     unsigned long age;
     displayLastTouch(x, y, f, age);
     Serial.printf("@TOUCH x=%d y=%d fingers=%d age=%lu\n", x, y, f, age);
-    return;
+    return true;
   }
 
   if (line == "RESET") {
@@ -716,46 +567,32 @@ static void handleSerialCommand(String line) {
     factoryReset();
     delay(300);
     ESP.restart();
-    return;
+    return true;
   }
 
   if (line.startsWith("SET ")) {
     int sp = line.indexOf(' ', 4);
-    if (sp < 0) { Serial.println("@ERR Invalid command"); return; }
+    if (sp < 0) { Serial.println("@ERR Invalid command"); return true; }
     String ssidHex = line.substring(4, sp);
     String passArg = line.substring(sp + 1);
 
     String ssid, pass;
-    if (!fromHex(ssidHex, ssid)) { Serial.println("@ERR Invalid network name"); return; }
+    if (!fromHex(ssidHex, ssid)) { Serial.println("@ERR Invalid network name"); return true; }
     if (passArg == "-") pass = "";
     else if (passArg == "=") pass = apPass;
-    else if (!fromHex(passArg, pass)) { Serial.println("@ERR Invalid password"); return; }
+    else if (!fromHex(passArg, pass)) { Serial.println("@ERR Invalid password"); return true; }
 
     String err = validateSettings(ssid, pass);
-    if (err.length()) { Serial.println("@ERR " + err); return; }
+    if (err.length()) { Serial.println("@ERR " + err); return true; }
 
     saveSettings(ssid, pass);
     Serial.println("@OK");
     Serial.flush();
     delay(300);
     ESP.restart();
-    return;
+    return true;
   }
-
-  Serial.println("@ERR Unknown command");
-}
-
-static void pollSerial() {
-  static String buf;
-  while (Serial.available()) {
-    char c = (char)Serial.read();
-    if (c == '\n' || c == '\r') {
-      if (buf.length()) handleSerialCommand(buf);
-      buf = "";
-    } else if (buf.length() < 1024) {
-      buf += c;
-    }
-  }
+  return false;
 }
 
 // ---------------------------------------------------------------- setup / loop
@@ -765,8 +602,10 @@ static unsigned long wakeUntil = 0;   // full brightness until then (PWR button 
 static bool onBattery = false;
 
 void setup() {
-  Serial.setRxBufferSize(4096);   // standaard 256 B: te klein voor FDATA-regels (~690 tekens)
-  Serial.begin(115200);
+  BoardLink::begin(APP_ID, FW_VERSION);   // USB protocol for the ESP32 Toolbox app
+  BoardLink::onCommand(handlePortalCommand);
+  BoardLink::onInfo(portalInfo);
+  BoardLink::onFileChanged(portalFileChanged);
   delay(500);
   Serial.println("\n[ESP32-Portal] start");
   setCpuFrequencyMhz(CPU_MHZ);          // power saving (default 240 MHz)
@@ -863,7 +702,7 @@ void loop() {
     server.handleClient();
   }
   checkResetButton();
-  pollSerial();
+  BoardLink::poll();
   updatePower();
   Tap tap = displayPollTap();
   if (tap.touched) {                       // touching keeps a dimmed (battery) display bright

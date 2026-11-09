@@ -1,15 +1,14 @@
-"""ESP32-Portal admin: change WiFi settings and the landing page over USB-C.
+"""WiFi Portal module for the ESP32 Toolbox.
 
-Start: double-click 'Portal Admin.exe' or 'admin/Portal Admin.bat' (or: python portal_admin.pyw).
-Requires Python 3 with pyserial (python -m pip install --user pyserial).
+WiFi settings, portals (landing pages with the page editor), surveys, results and
+backups of the ESP32-Portal firmware (the PlatformIO project in the repository root).
+Loaded by admin/toolbox.pyw; see admin/modules/README.md for the module interface.
 """
 
-import base64
 import copy
-import sys
-import csv
 import hashlib
 import html
+import csv
 import io
 import json
 import os
@@ -17,58 +16,38 @@ import queue
 import re
 import shutil
 import tempfile
-import zipfile
 import threading
 import time
 import tkinter as tk
 import webbrowser
+import zipfile
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
+import espcore as core
+from espcore import (BG, CARD, SURFACE2, SURFACE3, OUTLINE, TEXT, MUTED, PRIMARY, PRIMARY_LIGHT,  # noqa: F401
+                     ON_PRIMARY, SECONDARY, SUCCESS, IDLE, FONT, to_hex, from_hex, send_command)
 import portal_editor as pe
 
-try:
-    import serial
-    from serial.tools import list_ports
-except ImportError:  # pragma: no cover
-    _r = tk.Tk()
-    _r.withdraw()
-    messagebox.showerror("Portal Admin",
-                         "pyserial is missing.\n\nInstall with:\npython -m pip install --user pyserial")
-    raise SystemExit(1)
-
-# Interface-kleuren — Material Design dark theme
-# (achtergrond #121212, hogere elevatie = lichter oppervlak, gedesatureerde primaire kleur,
-#  tekst 87% / 60% wit)
-BG = "#121212"            # achtergrond (0dp)
-CARD = "#1E1E1E"          # oppervlak 1dp
-SURFACE2 = "#2C2C2C"      # oppervlak 8dp (knoppen, invoervelden, tabbladen)
-SURFACE3 = "#383838"      # hover
-OUTLINE = "#3D3D3D"
-TEXT = "#E1E1E1"          # high emphasis (87%)
-MUTED = "#9E9E9E"         # medium emphasis (60%)
-PRIMARY = "#9C89D7"
-PRIMARY_LIGHT = "#B6A8E5"
-ON_PRIMARY = "#121212"
-SECONDARY = "#FF9E71"
-SUCCESS = "#5DBB6A"
-IDLE = "#5A5A5A"
-FONT = "Segoe UI"
-
-ESPRESSIF_VID = 0x303A
-BAUD = 115200
-CHUNK = 512                       # bytes per FDATA-regel
-
+MODULE_ID = "portal"
 if os.environ.get("PORTAL_ADMIN_DIR"):          # testing with a separate content folder
     HERE = os.environ["PORTAL_ADMIN_DIR"]
-elif getattr(sys, "frozen", False):
-    # Running as "Portal Admin.exe" (PyInstaller): keep the editor content in
-    # the admin folder next to the exe, not in the temporary unpack folder.
-    _exe_dir = os.path.dirname(sys.executable)
-    HERE = os.path.join(_exe_dir, "admin") if os.path.isdir(os.path.join(_exe_dir, "admin")) else _exe_dir
 else:
-    HERE = os.path.dirname(os.path.abspath(__file__))
+    HERE = core.data_dir(MODULE_ID)             # admin/data/portal (stays on this PC)
 CONTENT_FILE = os.path.join(HERE, "portal_content.json")
 ASSETS_DIR = os.path.join(HERE, "portal_assets")
+
+
+def _migrate_old_files():
+    """The Portal Admin app (before the Toolbox) kept its content in the admin folder itself."""
+    if os.environ.get("PORTAL_ADMIN_DIR") or os.path.exists(CONTENT_FILE):
+        return
+    for name in ("portal_content.json", "portal_content.backup.json", "portal_assets"):
+        old = os.path.join(core.BASE, name)
+        if os.path.exists(old) and not os.path.exists(os.path.join(HERE, name)):
+            shutil.move(old, os.path.join(HERE, name))
+
+
+_migrate_old_files()
 
 DEFAULT_CONTENT = {
     "title": "Welcome",
@@ -108,77 +87,10 @@ SURVEY_KEYS = ("survey_on", "survey_type", "survey_question", "survey_yes", "sur
                "survey_placeholder", "thanks_heading", "thanks_text")
 
 
-# =========================================================================== serieel
+# =========================================================================== serial
 
-def find_ports():
-    ports = []
-    for p in list_ports.comports():
-        is_esp = p.vid == ESPRESSIF_VID
-        ports.append((p.device, f"{p.device} — {'ESP32-S3' if is_esp else p.description}", is_esp))
-    ports.sort(key=lambda x: (not x[2], x[0]))
-    return ports
-
-
-def to_hex(text):
-    return text.encode("utf-8").hex()
-
-
-def from_hex(text):
-    return bytes.fromhex(text).decode("utf-8", errors="replace")
-
-
-class Board:
-    """Eén seriële sessie met het bordje (gebruik met 'with')."""
-
-    def __init__(self, port):
-        self.s = serial.Serial()
-        self.s.port = port
-        self.s.baudrate = BAUD
-        self.s.timeout = 0.2
-        self.s.dtr = False      # laag houden: voorkomt resetten bij openen
-        self.s.rts = False
-        self.buf = b""
-
-    def __enter__(self):
-        self.s.open()
-        self.s.reset_input_buffer()
-        return self
-
-    def __exit__(self, *exc):
-        try:
-            self.s.close()
-        except Exception:
-            pass
-
-    def cmd(self, line, timeout=3.0):
-        self.s.write((line + "\n").encode("utf-8"))
-        deadline = time.time() + timeout
-        while time.time() < deadline:
-            # Lees wat er is (min. 1 byte) i.p.v. te wachten op een vol blok
-            self.buf += self.s.read(max(1, self.s.in_waiting))
-            while b"\n" in self.buf:
-                raw, self.buf = self.buf.split(b"\n", 1)
-                text = raw.decode("utf-8", errors="replace").strip()
-                if text.startswith("@"):
-                    return text[1:]
-        raise TimeoutError("No response from the board. Is the latest firmware installed?")
-
-    def ok(self, line, timeout=3.0):
-        reply = self.cmd(line, timeout)
-        if not reply.startswith("OK"):
-            raise RuntimeError(reply[4:] if reply.startswith("ERR") else reply)
-
-    def list_files(self):
-        """{name: size} of the files on the board, or None for firmware without FLIST."""
-        reply = self.cmd("FLIST")
-        if not reply.startswith("FLIST"):
-            return None
-        files = {}
-        for part in reply.split()[1:]:
-            name, _, size = part.rpartition(":")
-            if name:
-                files[name.lstrip("/")] = int(size or 0)
-        return files
+class Board(core.Board):
+    """Board connection with the portal-specific WIFI command."""
 
     def wifi(self):
         """{"ssid", "pass", "ap"} from the board, or None for firmware older than 2.5."""
@@ -189,56 +101,13 @@ class Board:
         return {"ssid": from_hex(vals.get("ssid", "")), "pass": from_hex(vals.get("pass", "")),
                 "ap": vals.get("ap", "1") == "1"}
 
-    def get_file(self, path, progress=None):
-        """Contents of a file on the board (b"" when it does not exist)."""
-        data = b""
-        while True:
-            reply = self.cmd(f"FREAD {path} {len(data)}")
-            if reply.startswith("EOF"):
-                return data
-            if not reply.startswith("DATA"):
-                raise RuntimeError(reply[4:] if reply.startswith("ERR") else reply)
-            chunk = base64.b64decode(reply[5:].strip())
-            if not chunk:
-                return data
-            data += chunk
-            if progress:
-                progress(len(data))
-
-    def put_file(self, path, data, progress=None):
-        self.ok(f"FBEGIN {path} {len(data)}")
-        try:
-            for i in range(0, len(data), CHUNK):
-                self.ok("FDATA " + base64.b64encode(data[i:i + CHUNK]).decode("ascii"))
-                if progress:
-                    progress(min(i + CHUNK, len(data)))
-            self.ok("FEND", timeout=5)
-        except Exception:
-            try:
-                self.cmd("FABORT")
-            except Exception:
-                pass
-            raise
-
-
-def send_command(port, command, timeout=3.0):
-    with Board(port) as b:
-        return b.cmd(command, timeout)
-
 
 def parse_info(reply):
-    if not reply.startswith("INFO"):
-        raise ValueError(f"Unexpected response: {reply}")
-    info = {}
-    for part in reply.split()[1:]:
-        key, _, value = part.partition("=")
-        info[key] = value
+    info = core.parse_kv(reply, "INFO")
     info["ssid"] = from_hex(info.get("ssid", ""))
     info["open"] = info.get("open") == "1"
     return info
 
-
-# =========================================================================== portal-inhoud
 
 def content_from(saved):
     """Complete, validated content from a saved dict (local file or the board's copy)."""
@@ -536,10 +405,11 @@ def merge_logs(*logs):
     return ("\n".join([header] + out) + "\n").encode("utf-8") if header else b""
 
 
-def write_backup(path, store, board, log):
-    """board: {"fw", "wifi", "active_portal"} or None (PC only)."""
+def write_backup(path, store, board, log, extra_images=None):
+    """board: {"fw", "wifi", "active_portal"} or None (PC only).
+    extra_images: {name: bytes} for images that are not on this PC (read from the board)."""
     with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
-        meta = {"format": BACKUP_FORMAT, "app": "Portal Admin", "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+        meta = {"format": BACKUP_FORMAT, "app": "ESP32 Toolbox / WiFi Portal", "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                 "board": board, "answers": max(0, len(log.splitlines()) - 1) if log else 0}
         z.writestr("backup.json", json.dumps(meta, ensure_ascii=False, indent=2))
         z.writestr("portals.json", json.dumps(dict(store_data(store), current=store["current"]),
@@ -547,6 +417,8 @@ def write_backup(path, store, board, log):
         for name in all_images(store):
             if os.path.exists(asset_path(name)):
                 z.write(asset_path(name), "images/" + name)
+            elif extra_images and name in extra_images:
+                z.writestr("images/" + name, extra_images[name])
         if log:
             z.writestr("responses.csv", log)
 
@@ -582,12 +454,9 @@ def read_backup(path):
 
 # =========================================================================== UI
 
-class App(tk.Tk):
-    def __init__(self):
-        super().__init__()
-        self.title("Portal Admin")
-        self.configure(bg=BG)
-        self.busy = False
+class Module(core.BaseModule):
+    def __init__(self, parent, host, module):
+        super().__init__(parent, host, module)
         self.has_password = False
         self.had_local_file = os.path.exists(CONTENT_FILE)
         self.store = load_store()
@@ -596,20 +465,17 @@ class App(tk.Tk):
         self.synced_ports = set()         # ports whose page was compared with this PC this session
         self.lock = threading.RLock()     # content is shared with the editor's web server
         self.rev = 1                      # bumped on every content change
-        self.status_kind = "idle"
         self.calls = queue.Queue()        # callables from other threads, run on the Tk thread
         self.editor = None
+        self.closed = False
 
-        self._style()
         self._build()
         self._load_editor()
-        self.update_idletasks()
-        w = max(self.winfo_reqwidth(), int(self.winfo_fpixels("5.2i")))
-        h = self.winfo_reqheight()
-        self.geometry(f"{w}x{h}")
-        self.minsize(w, h)
-        self.after(100, self.refresh_ports)
         self.after(150, self._run_calls)
+
+    @property
+    def status_kind(self):
+        return self.host.status_kind
 
     def _current_portal(self):
         return next(q for q in self.store["portals"] if q["id"] == self.store["current"])
@@ -619,6 +485,8 @@ class App(tk.Tk):
             save_store(self.store)
 
     def _run_calls(self):
+        if self.closed:
+            return
         try:
             while True:
                 self.calls.get_nowait()()
@@ -626,46 +494,15 @@ class App(tk.Tk):
             pass
         self.after(150, self._run_calls)
 
-    # ------------------------------------------------------------ opmaak
-    def _style(self):
-        st = ttk.Style(self)
-        st.theme_use("clam")
-        field = dict(fieldbackground=SURFACE2, background=SURFACE2, foreground=TEXT,
-                     bordercolor=OUTLINE, lightcolor=OUTLINE, darkcolor=OUTLINE,
-                     insertcolor=TEXT, arrowcolor=TEXT, selectbackground=PRIMARY,
-                     selectforeground=ON_PRIMARY)
-        st.configure("TEntry", padding=7, **field)
-        st.map("TEntry", fieldbackground=[("disabled", CARD)], foreground=[("disabled", IDLE)],
-               bordercolor=[("focus", PRIMARY)], lightcolor=[("focus", PRIMARY)])
-        st.configure("TCombobox", padding=6, **field)
-        st.map("TCombobox", fieldbackground=[("readonly", SURFACE2)], foreground=[("readonly", TEXT)],
-               background=[("active", SURFACE3), ("readonly", SURFACE2)],
-               selectbackground=[("readonly", SURFACE2)], selectforeground=[("readonly", TEXT)])
-        self.option_add("*TCombobox*Listbox.background", SURFACE2)
-        self.option_add("*TCombobox*Listbox.foreground", TEXT)
-        self.option_add("*TCombobox*Listbox.selectBackground", PRIMARY)
-        self.option_add("*TCombobox*Listbox.selectForeground", ON_PRIMARY)
-        st.configure("TCheckbutton", background=CARD, foreground=TEXT, font=(FONT, 10),
-                     indicatorbackground=SURFACE2, indicatorforeground=PRIMARY, bordercolor=OUTLINE)
-        st.map("TCheckbutton", background=[("active", CARD)],
-               indicatorbackground=[("selected", SURFACE2)])
-        st.configure("TNotebook", background=BG, borderwidth=0, tabmargins=(16, 0, 16, 0),
-                     bordercolor=CARD, lightcolor=CARD, darkcolor=CARD)
-        st.configure("TNotebook.Tab", padding=(18, 8), font=(FONT, 10, "bold"),
-                     background=BG, foreground=MUTED, borderwidth=0, lightcolor=BG, bordercolor=BG)
-        st.map("TNotebook.Tab", background=[("selected", CARD)], foreground=[("selected", PRIMARY)],
-               lightcolor=[("selected", CARD)])
-        st.configure("Horizontal.TProgressbar", troughcolor=SURFACE2, background=PRIMARY,
-                     bordercolor=SURFACE2, lightcolor=PRIMARY, darkcolor=PRIMARY)
-        st.configure("Treeview", background=SURFACE2, fieldbackground=SURFACE2, foreground=TEXT,
-                     bordercolor=OUTLINE, lightcolor=OUTLINE, darkcolor=OUTLINE, rowheight=24,
-                     font=(FONT, 9))
-        st.map("Treeview", background=[("selected", PRIMARY)], foreground=[("selected", ON_PRIMARY)])
-        st.configure("Treeview.Heading", background=CARD, foreground=MUTED, relief="flat",
-                     bordercolor=OUTLINE, lightcolor=CARD, darkcolor=CARD, font=(FONT, 9, "bold"))
-        st.map("Treeview.Heading", background=[("active", SURFACE3)])
-        st.configure("Vertical.TScrollbar", background=SURFACE2, troughcolor=CARD, bordercolor=CARD,
-                     lightcolor=SURFACE2, darkcolor=SURFACE2, arrowcolor=MUTED)
+    def close(self):
+        self.closed = True
+        try:
+            self._collect()
+        except Exception:  # noqa: BLE001
+            pass
+        if self.editor:
+            self.editor.stop()
+            self.editor = None
 
     def _button(self, parent, text, command, bg, fg=ON_PRIMARY, active=None, small=False):
         return tk.Button(parent, text=text, command=command, bg=bg, fg=fg,
@@ -682,34 +519,6 @@ class App(tk.Tk):
 
     # ------------------------------------------------------------ opbouw
     def _build(self):
-        header = tk.Frame(self, bg=SURFACE2, padx=20, pady=16)
-        header.pack(fill="x")
-        tk.Label(header, text="ESP32-PORTAL", bg=SURFACE2, fg=PRIMARY,
-                 font=(FONT, 8, "bold")).pack(anchor="w")
-        tk.Label(header, text="Portal Admin", bg=SURFACE2, fg=TEXT,
-                 font=(FONT, 17, "bold")).pack(anchor="w")
-
-        # Verbinding
-        conn = tk.Frame(self, bg=CARD, padx=20, pady=14)
-        conn.pack(fill="x", padx=16, pady=16)
-        row = tk.Frame(conn, bg=CARD)
-        row.pack(fill="x")
-        self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(row, textvariable=self.port_var, state="readonly")
-        self.port_box.pack(side="left", fill="x", expand=True)
-        self.port_box.bind("<<ComboboxSelected>>", lambda e: self.read_info())
-        self._button(row, "Search", self.refresh_ports, PRIMARY, active=PRIMARY_LIGHT, small=True).pack(
-            side="left", padx=(8, 0))
-        srow = tk.Frame(conn, bg=CARD)
-        srow.pack(fill="x", pady=(10, 0))
-        self.dot = tk.Canvas(srow, width=12, height=12, bg=CARD, highlightthickness=0)
-        self.dot_id = self.dot.create_oval(1, 1, 11, 11, fill=IDLE, outline="")
-        self.dot.pack(side="left")
-        self.status_var = tk.StringVar(value="Not connected")
-        tk.Label(srow, textvariable=self.status_var, bg=CARD, fg=TEXT, font=(FONT, 10),
-                 anchor="w", justify="left", wraplength=420).pack(side="left", padx=(8, 0), fill="x")
-        self.progress = ttk.Progressbar(conn, mode="determinate", style="Horizontal.TProgressbar")
-
         # Portal (profile) being edited
         bar = tk.Frame(self, bg=CARD, padx=20, pady=12)
         bar.pack(fill="x", padx=16, pady=(0, 16))
@@ -733,6 +542,7 @@ class App(tk.Tk):
 
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=16, pady=(0, 16))
+        self.add_firmware_tab(nb)
         nb.add(self._build_wifi(nb), text="WiFi")
         nb.add(self._build_portal(nb), text="Portal")
         nb.add(self._build_survey(nb), text="Survey")
@@ -755,9 +565,20 @@ class App(tk.Tk):
         self.ap_btn.pack(side="right")
         tk.Frame(tab, bg=OUTLINE, height=1).pack(fill="x", pady=(14, 14))
 
-        self._label(tab, "Network name (SSID)").pack(fill="x", pady=(0, 4))
-        self.ssid_var = tk.StringVar()
-        ttk.Entry(tab, textvariable=self.ssid_var, font=(FONT, 11)).pack(fill="x")
+        # network name of the portal chosen at the top (changes with the portal)
+        self.pssid_title = self._label(tab, "Network name (SSID)")
+        self.pssid_title.pack(fill="x", pady=(0, 4))
+        self.pssid_var = tk.StringVar()
+        self.pssid_entry = ttk.Entry(tab, textvariable=self.pssid_var, font=(FONT, 11))
+        self.pssid_entry.pack(fill="x")
+        self.pssid_entry.bind("<FocusOut>", lambda e: (self._collect(), self._update_wifi_labels()))
+        self.pssid_entry.bind("<KeyRelease>", lambda e: self._update_wifi_labels())
+        self.pssid_hint = self._label(tab, "", color=MUTED, size=9)
+        self.pssid_hint.configure(justify="left", wraplength=420)
+        self.pssid_hint.pack(fill="x", pady=(4, 0))
+        # shown when another portal is active on the board
+        self.ssid_note = self._label(tab, "", color=SECONDARY, size=9)
+        self.ssid_note.configure(justify="left", wraplength=420)
         self.open_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(tab, text="Open network (no password)", variable=self.open_var,
                         command=self._toggle_pass).pack(anchor="w", pady=(12, 0))
@@ -767,6 +588,12 @@ class App(tk.Tk):
         self.pass_entry.pack(fill="x")
         self.pass_hint = self._label(tab, "", color=MUTED, size=9)
         self.pass_hint.pack(fill="x", pady=(4, 0))
+        self._label(tab, "Default network name (for portals without their own name)").pack(
+            fill="x", pady=(12, 4))
+        self.ssid_var = tk.StringVar()
+        self.ssid_entry = ttk.Entry(tab, textvariable=self.ssid_var, font=(FONT, 10))
+        self.ssid_entry.pack(fill="x")
+        self.ssid_entry.bind("<KeyRelease>", lambda e: self._update_wifi_labels())
         self.info_var = tk.StringVar()
         tk.Label(tab, textvariable=self.info_var, bg=CARD, fg=MUTED, font=(FONT, 9),
                  anchor="w").pack(fill="x", pady=(10, 0))
@@ -787,23 +614,14 @@ class App(tk.Tk):
     def _build_portal(self, parent):
         tab = tk.Frame(parent, bg=CARD, padx=20, pady=18)
 
-        grid = tk.Frame(tab, bg=CARD)
-        grid.pack(fill="x", pady=(0, 14))
-        grid.columnconfigure(0, weight=1)
-        grid.columnconfigure(1, weight=1)
-        self.pname_var, self.pssid_var = tk.StringVar(), tk.StringVar()
-        self._label(grid, "Portal name (shown on the ESP32 display)").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self._label(grid, "Network name for this portal (optional)").grid(
-            row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
-        name_entry = ttk.Entry(grid, textvariable=self.pname_var, font=(FONT, 10))
-        name_entry.grid(row=1, column=0, sticky="ew")
+        self.pname_var = tk.StringVar()
+        self._label(tab, "Portal name (shown on the ESP32 display)").pack(fill="x", pady=(0, 4))
+        name_entry = ttk.Entry(tab, textvariable=self.pname_var, font=(FONT, 10))
+        name_entry.pack(fill="x")
         name_entry.bind("<FocusOut>", lambda e: self._collect())
         name_entry.bind("<Return>", lambda e: self._collect())
-        ssid_entry = ttk.Entry(grid, textvariable=self.pssid_var, font=(FONT, 10))
-        ssid_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0))
-        ssid_entry.bind("<FocusOut>", lambda e: self._collect())
-        self._label(grid, "Empty network name = the name from the WiFi tab.", color=MUTED, size=9).grid(
-            row=2, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
+        self._label(tab, "Its network name is set in the WiFi tab.", color=MUTED, size=9).pack(
+            fill="x", pady=(4, 14))
 
         box = tk.Frame(tab, bg=SURFACE2, padx=16, pady=14)
         box.pack(fill="x")
@@ -983,74 +801,14 @@ class App(tk.Tk):
         self.restore_btn.pack(fill="x", pady=(8, 0))
         return tab
 
-    # ------------------------------------------------------------ status / taken
-    def set_status(self, text, color=IDLE):
-        self.status_kind = {PRIMARY: "busy", SUCCESS: "ok", SECONDARY: "err"}.get(color, "idle")
-        self.status_text = text           # plain copy for the editor's web server thread
-        self.status_var.set(text)
-        self.dot.itemconfigure(self.dot_id, fill=color)
-
-    def run_bg(self, work, done, busy_text, progress_total=None):
-        """Voert work(report) uit in een thread; report(n) werkt de voortgangsbalk bij."""
-        if self.busy:
-            return
-        self.busy = True
-        for b in self.action_buttons:
-            b.configure(state="disabled")
-        self.set_status(busy_text, PRIMARY)
-        if progress_total:
-            self.progress.configure(maximum=progress_total, value=0)
-            self.progress.pack(fill="x", pady=(10, 0))
-        q = queue.Queue()
-
-        def worker():
-            try:
-                q.put(("done", work(lambda n: q.put(("progress", n))), None))
-            except Exception as exc:  # noqa: BLE001
-                q.put(("done", None, exc))
-
-        def poll():
-            try:
-                while True:
-                    item = q.get_nowait()
-                    if item[0] == "progress":
-                        if item[1] > float(self.progress.cget("maximum")):
-                            self.progress.configure(maximum=item[1] * 1.2)
-                        self.progress.configure(value=item[1])
-                    else:
-                        self._finish(done, item[1], item[2])
-                        return
-            except queue.Empty:
-                self.after(50, poll)
-
-        threading.Thread(target=worker, daemon=True).start()
-        self.after(50, poll)
-
-    def _finish(self, done, result, error):
-        self.busy = False
-        for b in self.action_buttons:
-            b.configure(state="normal")
-        self.progress.pack_forget()
-        if error:
-            msg = str(error)
-            if isinstance(error, serial.SerialException):
-                msg = "Cannot open the port. Is the serial monitor or another program still using it?"
-            self.set_status(msg, SECONDARY)
-        else:
-            done(result)
-
-    def port(self):
-        v = self.port_var.get()
-        return v.split(" — ")[0] if v else None
-
     # ------------------------------------------------------------ WiFi
     def _toggle_pass(self):
         if self.open_var.get():
             self.pass_entry.state(["disabled"])
-            self.pass_hint.configure(text="Anyone can connect without a password.")
+            self.pass_hint.configure(text="Anyone can connect without a password (all portals).")
         else:
             self.pass_entry.state(["!disabled"])
-            hint = "8–63 characters."
+            hint = "8–63 characters. The same password for all portals."
             if self.has_password:
                 hint += " Leave empty to keep the current password."
             self.pass_hint.configure(text=hint)
@@ -1066,7 +824,7 @@ class App(tk.Tk):
     def toggle_ap(self):
         port = self.port()
         if not port:
-            self.set_status("Select a port first.", SECONDARY)
+            self.no_port()
             return
         turn_on = not self.ap_on
 
@@ -1100,7 +858,30 @@ class App(tk.Tk):
                           + (f"  ·  WiFi power {info['txp']}%" if "txp" in info else ""))
         self.board_portal = info.get("portal") if info.get("portal") not in (None, "-") else None
         self.board_fw_portals = "portal" in info
+        self.broadcast_ssid = from_hex(info["essid"]) if info.get("essid") else info["ssid"]
+        self.board_default_ssid = info["ssid"]
+        self._update_wifi_labels()
         self._refresh_portal_bar()
+
+    def _portal_name(self, pid):
+        return next((q["name"] for q in self.store["portals"] if q["id"] == pid), "?")
+
+    def _update_wifi_labels(self):
+        """WiFi tab: the network name of the portal chosen at the top, and what the board broadcasts."""
+        c = self.content
+        self.pssid_title.configure(text=f"Network name of “{c['name']}”")
+        default = self.ssid_var.get().strip() or "?"
+        own = self.pssid_var.get().strip()
+        self.pssid_hint.configure(text=(f"Empty: this portal uses the default name “{default}” (below)."
+                                        if not own else "Own name of this portal; empty = the default name."))
+        broadcast = getattr(self, "broadcast_ssid", None)
+        if broadcast and self.board_portal and self.board_portal != c["id"]:
+            self.ssid_note.configure(text=f"Active on the ESP32 now: “{self._portal_name(self.board_portal)}”, "
+                                          f"broadcasting “{broadcast}”. This name is used when "
+                                          f"“{c['name']}” is active.")
+            self.ssid_note.pack(after=self.pssid_hint, fill="x", pady=(4, 0))
+        else:
+            self.ssid_note.pack_forget()
 
     @staticmethod
     def _battery_text(info):
@@ -1111,39 +892,35 @@ class App(tk.Tk):
             return "  ·  no battery"
         return f"  ·  battery {bat}%" + (" (charging)" if info.get("chg") == "1" else "")
 
-    def refresh_ports(self):
-        ports = find_ports()
-        labels = [label for _, label, _ in ports]
-        self.port_box["values"] = labels
-        esp = [label for _, label, is_esp in ports if is_esp]
-        if esp:
-            self.port_var.set(esp[0])
-            self.read_info()
-        else:
-            self.port_var.set(labels[0] if labels else "")
-            self.set_status("No ESP32 found. Connect the board and click Search.", SECONDARY)
+    def connected(self, port, reply):
+        """The Toolbox found this project on `port`: show its info and fetch its portals once."""
+        info = parse_info(reply)
+        self._show_info(info)
+        if port in self.synced_ports:
+            return
+        self.synced_ports.add(port)
+
+        def work(_r):
+            with Board(port) as b:
+                return b.get_file(BOARD_CONTENT)
+
+        self.run_bg(work, lambda data: self._sync_from_board(port, data), "Reading the portals on the board…")
 
     def read_info(self):
         port = self.port()
         if not port:
+            self.no_port()
             return
-
-        sync = port not in self.synced_ports      # once per session: fetch the board's page first
 
         def work(_r):
             with Board(port) as b:
-                info = parse_info(b.cmd("INFO"))
-                return info, (b.get_file(BOARD_CONTENT) if sync else None)
+                return parse_info(b.cmd("INFO"))
 
-        def done(result):
-            info, data = result
+        def done(info):
             self._show_info(info)
             self.set_status(f"Connected to {port}", SUCCESS)
-            if sync:
-                self.synced_ports.add(port)
-                self._sync_from_board(port, data)
 
-        self.run_bg(work, done, f"Connecting to {port}…")
+        self.run_bg(work, done, f"Reading {port}…")
 
     def _sync_from_board(self, port, data):
         """Use the portals stored on the board, unless this PC has newer changes (then ask)."""
@@ -1219,25 +996,25 @@ class App(tk.Tk):
             done(None)
 
     def _wait_for_restart(self, port):
-        time.sleep(2.5)
-        deadline = time.time() + 20
-        last = None
-        while time.time() < deadline:
-            try:
-                return parse_info(send_command(port, "INFO", timeout=1.5))
-            except Exception as exc:  # noqa: BLE001
-                last = exc
-                time.sleep(1)
-        raise TimeoutError(f"Board not responding after restart ({last}). Click Refresh.")
+        try:
+            return parse_info(core.wait_for_info(port))
+        except TimeoutError as exc:
+            raise TimeoutError(f"{exc} Click Refresh.") from None
 
     def save_wifi(self):
+        """Saves the portal's own network name (with an upload of the portals) and, when changed, the
+        default name and password (SET, the board restarts)."""
         port = self.port()
         if not port:
-            self.set_status("Select a port first.", SECONDARY)
+            self.no_port()
+            return
+        own = self.pssid_var.get().strip()
+        if len(own.encode("utf-8")) > 32:
+            messagebox.showwarning("Portal Admin", "Network name must be at most 32 characters.")
             return
         ssid = self.ssid_var.get().strip()
         if not 1 <= len(ssid.encode("utf-8")) <= 32:
-            messagebox.showwarning("Portal Admin", "Network name must be 1 to 32 characters.")
+            messagebox.showwarning("Portal Admin", "Default network name must be 1 to 32 characters.")
             return
         if self.open_var.get():
             pass_arg = "-"
@@ -1253,18 +1030,39 @@ class App(tk.Tk):
                 return
             else:
                 pass_arg = to_hex(pw)
+        password_same = (pass_arg == "-" and not self.has_password) or (pass_arg == "=")
+        need_set = ssid != getattr(self, "board_default_ssid", None) or not password_same
+        self._collect()
+        with self.lock:
+            need_upload = store_hash(self.store) != self.store.get("synced_hash")
 
-        def work(_r):
+        def set_work(_r):
             reply = send_command(port, f"SET {to_hex(ssid)} {pass_arg}")
             if reply.startswith("ERR"):
                 raise ValueError(reply[4:] or "Save failed")
             return self._wait_for_restart(port)
 
+        def info_work(_r):
+            with Board(port) as b:
+                return parse_info(b.cmd("INFO"))
+
         def done(info):
             self._show_info(info)
-            self.set_status(f"Saved. The network is now called '{info['ssid']}'.", SUCCESS)
+            name = self.content["ssid"] or info["ssid"]
+            if self.board_portal == self.content["id"]:
+                self.set_status(f"Saved. The ESP32 broadcasts “{self.broadcast_ssid}”.", SUCCESS)
+            else:
+                self.set_status(f"Saved. “{self.content['name']}” uses “{name}” when it is active; the ESP32 "
+                                f"broadcasts “{self.broadcast_ssid}” now.", SUCCESS)
 
-        self.run_bg(work, done, "Saving and restarting…")
+        def board_step():
+            self.run_bg(set_work if need_set else info_work, done,
+                        "Saving and restarting…" if need_set else "Reading the board…")
+
+        if need_upload:
+            self.upload_portal(then=board_step)
+        else:
+            board_step()
 
     def factory_reset(self):
         port = self.port()
@@ -1362,7 +1160,7 @@ class App(tk.Tk):
     def activate_portal(self):
         port = self.port()
         if not port:
-            self.set_status("Select a port first.", SECONDARY)
+            self.no_port()
             return
         pid, name = self.content["id"], self.content["name"]
 
@@ -1385,6 +1183,7 @@ class App(tk.Tk):
         c = self.content
         self.pname_var.set(c["name"])
         self.pssid_var.set(c["ssid"])
+        self._update_wifi_labels()
         self._refresh_portal_bar()
         self._update_summary()
         self.survey_on_var.set(bool(c["survey_on"]))
@@ -1518,7 +1317,7 @@ class App(tk.Tk):
             return
         port = self.port()
         if not port:
-            self.set_status("Select a port first.", SECONDARY)
+            self.no_port()
             return
         self._collect()
         with self.lock:
@@ -1656,8 +1455,10 @@ class App(tk.Tk):
 
     def restore_backup(self):
         path = filedialog.askopenfilename(title="Restore backup", filetypes=[("Portal backup", "*.zip")])
-        if not path:
-            return
+        if path:
+            self._restore_path(path)
+
+    def _restore_path(self, path, confirm=True):
         try:
             meta, store, images, log = read_backup(path)
         except (OSError, ValueError) as exc:
@@ -1681,7 +1482,7 @@ class App(tk.Tk):
         else:
             lines.append("No ESP32 is connected: only this PC is restored. Connect the ESP32 and restore "
                          "again to put everything on it.")
-        if not messagebox.askyesno("Restore backup", "\n".join(lines) + "\n\nRestore now?"):
+        if confirm and not messagebox.askyesno("Restore backup", "\n".join(lines) + "\n\nRestore now?"):
             return
 
         # 1. this PC
@@ -1732,6 +1533,7 @@ class App(tk.Tk):
 
         def board_done(result):
             info, merged = result
+            self.synced_ports.add(port)
             self._show_info(info)
             n = max(0, len(merged.splitlines()) - 1) if merged else 0
             self.set_status(f"Backup restored on this PC and the ESP32 ({len(store['portals'])} portal(s), "
@@ -1739,11 +1541,67 @@ class App(tk.Tk):
 
         self.upload_portal(then=lambda: self.run_bg(board_work, board_done, "Restoring answers and WiFi…"))
 
+    # ------------------------------------------------------------ Toolbox: switching projects
+    def save_state(self):
+        self._collect()
+
+    def restore_backup_file(self, port, path):
+        self._restore_path(path)
+
+    @staticmethod
+    def backup_board(port, path):
+        """Backup of what is on the board (portals, images, WiFi, answers) before another project
+        is installed. Uses the board's own portal settings; images missing on this PC are read
+        from the board. Runs in a thread, without the UI."""
+        local = load_store()
+        with Board(port) as b:
+            info = parse_info(b.cmd("INFO"))
+            wifi = b.wifi()
+            log = b.get_file(SURVEY_LOG)
+            data = b.get_file(BOARD_CONTENT)
+            store = local
+            if data:
+                try:
+                    store = store_from(json.loads(data.decode("utf-8")))
+                    store["current"] = local["current"] if local["current"] in \
+                        [q["id"] for q in store["portals"]] else store["portals"][0]["id"]
+                except ValueError:
+                    store = local
+            extra = {}
+            for name in all_images(store):
+                if not os.path.exists(asset_path(name)) and pe.valid_file(name):
+                    blob = b.get_file("/" + name)
+                    if blob:
+                        extra[name] = blob
+        board = {"fw": info.get("fw"), "wifi": wifi,
+                 "active_portal": info.get("portal") if info.get("portal") not in (None, "-") else None}
+        write_backup(path, store, board, log, extra)
+
+    def restore_after_install(self, port, reply, path):
+        """The portal was installed again. Flashing keeps the files and settings on the board,
+        so usually everything is still there; only when the portals are gone (another project
+        erased them) the last backup is put back."""
+        def work(_r):
+            with Board(port) as b:
+                return b.get_file(BOARD_CONTENT)
+
+        def done(data):
+            if data:
+                self.set_status("WiFi Portal installed; the portals and settings were still on the board.",
+                                SUCCESS)
+                self.connected(port, reply)
+            else:
+                self._show_info(parse_info(reply))
+                self.set_status("The portals are gone from the board: restoring the last backup…", PRIMARY)
+                self._restore_path(path, confirm=False)
+
+        self.run_bg(work, done, "Checking the portals on the board…")
+
     # ------------------------------------------------------------ Results
     def load_results(self):
         port = self.port()
         if not port:
-            self.set_status("Select a port first.", SECONDARY)
+            self.no_port()
             return
 
         def work(_r):
@@ -1852,5 +1710,3 @@ class App(tk.Tk):
         self.run_bg(work, done, "Clearing log…")
 
 
-if __name__ == "__main__":
-    App().mainloop()

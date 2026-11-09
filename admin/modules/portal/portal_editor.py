@@ -310,6 +310,10 @@ class EditorServer:
     def open_window(self):
         open_app_window(self.url)
 
+    def stop(self):
+        """Stops the server (when the module is closed); an open editor window then shows offline."""
+        threading.Thread(target=lambda: (self.httpd.shutdown(), self.httpd.server_close()), daemon=True).start()
+
 
 def find_edge():
     for base in (os.environ.get("ProgramFiles(x86)"), os.environ.get("ProgramFiles"),

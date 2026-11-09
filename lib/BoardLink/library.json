@@ -1,0 +1,7 @@
+{
+  "name": "BoardLink",
+  "version": "1.0.0",
+  "description": "Shared USB protocol between ESP32 projects and the ESP32 Toolbox app",
+  "frameworks": "arduino",
+  "platforms": "espressif32"
+}
