@@ -1,6 +1,6 @@
 #pragma once
 
-#define FW_VERSION "2.1"
+#define FW_VERSION "2.6"
 
 // Personal settings go in include/config_local.h (not in git).
 // Copy include/config_local.example.h to include/config_local.h and edit it.
@@ -59,11 +59,27 @@
 #define DISPLAY_BRIGHTNESS 170   // 0-255; lower = less AMOLED burn-in
 #endif
 
-// Battery mode: on battery (no USB) the display dims; a short press on the
-// PWR button wakes it to full brightness for WAKE_SECONDS.
+// Battery mode: on battery (no USB) the display dims; a short press on the PWR
+// button or touching the screen wakes it to full brightness for WAKE_SECONDS.
 #ifndef DIM_BRIGHTNESS
 #define DIM_BRIGHTNESS 15
 #endif
 #ifndef WAKE_SECONDS
 #define WAKE_SECONDS 10
+#endif
+// ...and after SCREEN_OFF_SECONDS more without a touch the display switches off
+// (a touch or the PWR button switches it on again).
+#ifndef SCREEN_OFF_SECONDS
+#define SCREEN_OFF_SECONDS 30
+#endif
+
+// ---- Power saving ----------------------------------------------------------
+// 80 MHz is plenty for the portal and uses clearly less power than 240 MHz.
+#ifndef CPU_MHZ
+#define CPU_MHZ 80
+#endif
+// WiFi transmit power, chosen with the TX button on the display:
+// 25% = 7 dBm, 50% = 11 dBm (a classroom), 75% = 15 dBm, 100% = 19.5 dBm (a hall)
+#ifndef DEFAULT_TX_LEVEL
+#define DEFAULT_TX_LEVEL 1   // 0 = 25%, 1 = 50%, 2 = 75%, 3 = 100%
 #endif

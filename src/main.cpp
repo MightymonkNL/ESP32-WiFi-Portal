@@ -24,6 +24,22 @@
 #include "survey.h"
 #include "power.h"
 
+// Editor content (JSON) stored by the admin app, so a new PC can download it
+#define PORTAL_CONTENT "/portal.json"
+
+// ---- Multiple portals (profiles) -------------------------------------------
+// /portals.cfg (uploaded by the admin app): one portal per line,
+//   <id> TAB <name> TAB <ssid or empty>
+// Files of a portal: /p-<id>-index.html, /p-<id>-thanks.html, /p-<id>-survey.cfg.
+// Images are shared (content-hash names in the root). Without /portals.cfg the
+// root files are used (single portal, as in firmware 2.3 and older).
+#define PORTALS_CFG "/portals.cfg"
+#define MAX_PORTALS 8
+struct PortalDef { String id, name, ssid; };
+static PortalDef portals[MAX_PORTALS];
+static String portalNames[MAX_PORTALS];
+static int nPortals = 0, activePortal = 0, portalRev = 0;
+
 static const byte DNS_PORT = 53;
 static const IPAddress apIP(AP_IP);
 static const IPAddress netMask(AP_NETMASK);
@@ -37,6 +53,24 @@ String apPass;
 bool apEnabled = true;     // netwerk aan/uit (bewaard in NVS)
 bool apRunning = false;
 
+// WiFi transmit power levels (TX button on the display), in 0.25 dBm units
+static const int8_t TX_QDBM[4] = {28, 44, 60, 78};      // 7, 11, 15, 19.5 dBm
+static const uint8_t TX_PCT[4] = {25, 50, 75, 100};
+static int txLevel = DEFAULT_TX_LEVEL;
+String runningSsid;        // SSID the access point was started with
+
+// Network name of the active portal, or the general one
+static String effectiveSsid() {
+  if (nPortals && portals[activePortal].ssid.length()) return portals[activePortal].ssid;
+  return apSsid;
+}
+
+// Path of a file of the active portal, e.g. portalPath("index.html")
+static String portalPath(const char *file) {
+  if (!nPortals) return String("/") + file;
+  return "/p-" + portals[activePortal].id + "-" + file;
+}
+
 // ---------------------------------------------------------------- instellingen
 
 static void loadSettings() {
@@ -44,6 +78,7 @@ static void loadSettings() {
   apSsid = prefs.getString("ssid", AP_SSID);
   apPass = prefs.getString("pass", AP_PASSWORD);
   apEnabled = prefs.getBool("on", true);
+  txLevel = constrain(prefs.getUChar("txp", DEFAULT_TX_LEVEL), 0, 3);
   prefs.end();
   if (apSsid.isEmpty()) apSsid = AP_SSID;
 }
@@ -73,8 +108,10 @@ static void startAP() {
   WiFi.mode(WIFI_AP);
   WiFi.softAPConfig(apIP, apIP, netMask);
   const char *pass = apPass.length() >= 8 ? apPass.c_str() : nullptr;
-  WiFi.softAP(apSsid.c_str(), pass, AP_CHANNEL, 0, AP_MAX_CONN);
+  runningSsid = effectiveSsid();
+  WiFi.softAP(runningSsid.c_str(), pass, AP_CHANNEL, 0, AP_MAX_CONN);
   WiFi.setSleep(false);
+  esp_wifi_set_max_tx_power(TX_QDBM[txLevel]);
   // Devices that leave without signing off are dropped after 15 s without traffic
   // (ESP-IDF default is 300 s, which leaves stale entries in the device count).
   esp_wifi_set_inactive_time(WIFI_IF_AP, 15);
@@ -89,7 +126,7 @@ static void startAP() {
     serverStarted = true;
     Serial.println("[HTTP] web server running on port 80");
   }
-  Serial.printf("[WiFi] ON  SSID: %s (%s)  IP: %s\n", apSsid.c_str(),
+  Serial.printf("[WiFi] ON  SSID: %s (%s)  IP: %s\n", runningSsid.c_str(),
                 pass ? "password" : "open", WiFi.softAPIP().toString().c_str());
 }
 
@@ -101,11 +138,81 @@ static void stopAP() {
   Serial.println("[WiFi] OFF  network disabled");
 }
 
+static void cycleTxPower() {
+  txLevel = (txLevel + 1) % 4;
+  prefs.begin("portal", false);
+  prefs.putUChar("txp", txLevel);
+  prefs.end();
+  if (apRunning) esp_wifi_set_max_tx_power(TX_QDBM[txLevel]);
+  Serial.printf("[WiFi] transmit power %d%% (%.1f dBm)\n", TX_PCT[txLevel], TX_QDBM[txLevel] / 4.0);
+}
+
 static void setApEnabled(bool on) {
   apEnabled = on;
   saveEnabled(on);
   if (on && !apRunning) startAP();
   if (!on && apRunning) stopAP();
+}
+
+// ---------------------------------------------------------------- portals
+
+static bool validPortalId(const String &id) {
+  if (id.isEmpty() || id.length() > 8) return false;
+  for (char c : id)
+    if (!isalnum((unsigned char)c)) return false;
+  return true;
+}
+
+// Activates the portal: its survey, and its network name (restarts the AP if it changed).
+static void applyPortal() {
+  surveySetConfig(portalPath("survey.cfg"));
+  surveyReload();
+  if (apRunning && effectiveSsid() != runningSsid) {
+    stopAP();
+    startAP();
+  }
+  portalRev++;
+  Serial.printf("[PORTAL] active: %s\n", nPortals ? portals[activePortal].name.c_str() : "(single)");
+}
+
+static void loadPortals() {
+  nPortals = 0;
+  if (LittleFS.exists(PORTALS_CFG)) {
+    File f = LittleFS.open(PORTALS_CFG, "r");
+    while (f.available() && nPortals < MAX_PORTALS) {
+      String line = f.readStringUntil('\n');
+      line.replace("\r", "");
+      int t1 = line.indexOf('\t');
+      int t2 = t1 < 0 ? -1 : line.indexOf('\t', t1 + 1);
+      if (t1 < 0) continue;
+      PortalDef d;
+      d.id = line.substring(0, t1);
+      d.name = t2 < 0 ? line.substring(t1 + 1) : line.substring(t1 + 1, t2);
+      d.ssid = t2 < 0 ? "" : line.substring(t2 + 1);
+      if (!validPortalId(d.id) || d.ssid.length() > 32) continue;
+      if (d.name.isEmpty()) d.name = "Portal " + String(nPortals + 1);
+      portals[nPortals] = d;
+      portalNames[nPortals] = d.name;
+      nPortals++;
+    }
+    f.close();
+  }
+  prefs.begin("portal", true);
+  String want = prefs.getString("portal", "");
+  prefs.end();
+  activePortal = 0;
+  for (int i = 0; i < nPortals; i++)
+    if (portals[i].id == want) activePortal = i;
+}
+
+static bool selectPortal(int index) {
+  if (index < 0 || index >= nPortals) return false;
+  activePortal = index;
+  prefs.begin("portal", false);
+  prefs.putString("portal", portals[index].id);
+  prefs.end();
+  applyPortal();
+  return true;
 }
 
 // Geeft een foutmelding terug, of "" als de waarden geldig zijn.
@@ -155,6 +262,7 @@ static String contentType(const String &path) {
   if (path.endsWith(".json")) return "application/json";
   if (path.endsWith(".png"))  return "image/png";
   if (path.endsWith(".jpg") || path.endsWith(".jpeg")) return "image/jpeg";
+  if (path.endsWith(".gif"))  return "image/gif";
   if (path.endsWith(".svg"))  return "image/svg+xml";
   if (path.endsWith(".ico"))  return "image/x-icon";
   if (path.endsWith(".webp")) return "image/webp";
@@ -165,8 +273,15 @@ static String contentType(const String &path) {
 static bool serveFile(String path) {
   if (path.endsWith("/")) path += "index.html";
   if (path.startsWith("/.")) return false;  // interne bestanden (bijv. /.upload)
+  if (path == "/index.html" || path == "/thanks.html") path = portalPath(path.c_str() + 1);
+  if (path == PORTALS_CFG || path.endsWith("survey.cfg")) return false;
+  // Survey answers, voter keys and the app's settings are only readable over USB
+  if (path == SURVEY_LOG || path == SURVEY_VOTERS || path == SURVEY_CFG || path == PORTAL_CONTENT)
+    return false;
   if (!LittleFS.exists(path)) return false;
   File f = LittleFS.open(path, "r");
+  // Editor images are named after their content hash, so browsers may cache them for good
+  if (path.startsWith("/img-")) server.sendHeader("Cache-Control", "max-age=31536000, immutable");
   server.streamFile(f, contentType(path));
   f.close();
   return true;
@@ -322,8 +437,10 @@ static void handleAnswer() {
   recentIp[slot] = ip;
   recentAt[slot] = millis();
 
-  String err = surveyRecord(server.arg("a").toInt(), server.arg("t"),
-                            deviceFromUserAgent(server.header("User-Agent")), currentVoterKey());
+  String device = deviceFromUserAgent(server.header("User-Agent"));
+  String err = surveyType() == "open"
+                   ? surveyRecordText(server.arg("txt"), server.arg("t"), device, currentVoterKey())
+                   : surveyRecord(server.arg("a").toInt(), server.arg("t"), device, currentVoterKey());
   if (err.length()) Serial.println("[SURVEY] not stored: " + err);
   String target = String("http://") + apIP.toString() + "/thanks.html";
   if (err == "Already answered") target += "?dup=1";
@@ -384,6 +501,9 @@ static void checkResetButton() {
 //   FEND                      -> @OK: bestand vervangen; @ERR bij onvolledige upload
 //   FABORT                    -> upload afbreken
 //   FDEL <pad>                -> bestand verwijderen
+//   FLIST                     -> @FLIST <naam>:<grootte> ... (bestanden in de root)
+//   PORTAL <id>               -> @OK: activeer die portal (zie /portals.cfg)
+//   WIFI                      -> @WIFI ssid=<hex> pass=<hex> ap=<0|1> (voor de backup in de app)
 
 
 static const char *UPLOAD_TMP = "/.upload";
@@ -451,7 +571,8 @@ static bool handleFileCommand(const String &line) {
     LittleFS.remove(upPath);
     if (!LittleFS.rename(UPLOAD_TMP, upPath)) { Serial.println("@ERR Save failed"); return true; }
     Serial.printf("[FS] %s updated (%u bytes)\n", upPath.c_str(), (unsigned)upSize);
-    if (upPath == SURVEY_CFG) surveyReload();
+    if (upPath == PORTALS_CFG) { loadPortals(); applyPortal(); }
+    else if (upPath == portalPath("survey.cfg")) surveyReload();
     Serial.println("@OK");
     return true;
   }
@@ -460,7 +581,8 @@ static bool handleFileCommand(const String &line) {
     String path = line.substring(5);
     if (!validPath(path)) { Serial.println("@ERR Invalid path"); return true; }
     LittleFS.remove(path);
-    if (path == SURVEY_CFG) surveyReload();
+    if (path == PORTALS_CFG) { loadPortals(); applyPortal(); }
+    else if (path == portalPath("survey.cfg")) surveyReload();
     Serial.println("@OK");
     return true;
   }
@@ -483,6 +605,25 @@ static bool handleFileCommand(const String &line) {
     enc[olen] = 0;
     Serial.print("@DATA ");
     Serial.println((const char *)enc);
+    return true;
+  }
+  if (line == "FLIST") {
+    // FLIST -> @FLIST <name>:<size> ... (files in the root, without internal files)
+    String out = "@FLIST";
+    File root = LittleFS.open("/");
+    for (File f = root.openNextFile(); f; f = root.openNextFile()) {
+      String name = f.name();
+      if (name.startsWith("/")) name = name.substring(1);
+      if (!f.isDirectory() && !name.startsWith(".")) {
+        out += ' ';
+        out += name;
+        out += ':';
+        out += String((unsigned)f.size());
+      }
+      f.close();
+    }
+    root.close();
+    Serial.println(out);
     return true;
   }
   if (line == "LOGCLEAR") {
@@ -525,11 +666,28 @@ static void handleSerialCommand(String line) {
 
   if (line == "INFO") {
     PowerStatus ps = pmuStatus();
-    Serial.printf("@INFO ssid=%s open=%d clients=%d ip=%s fw=%s lcd=%s ap=%d bat=%d chg=%d\n",
+    Serial.printf("@INFO ssid=%s open=%d clients=%d ip=%s fw=%s lcd=%s ap=%d bat=%d chg=%d portal=%s essid=%s txp=%d\n",
                   toHex(apSsid).c_str(), apPass.isEmpty() ? 1 : 0,
                   apRunning ? WiFi.softAPgetStationNum() : 0, apIP.toString().c_str(), FW_VERSION,
                   displayDriver(), apRunning ? 1 : 0, ps.battery ? ps.percent : -1,
-                  ps.battery && ps.charging ? 1 : 0);
+                  ps.battery && ps.charging ? 1 : 0, nPortals ? portals[activePortal].id.c_str() : "-",
+                  toHex(effectiveSsid()).c_str(), TX_PCT[txLevel]);
+    return;
+  }
+
+  if (line == "WIFI") {
+    // WIFI -> @WIFI ssid=<hex> pass=<hex> ap=<0|1>  (for the app's backup; USB only)
+    Serial.printf("@WIFI ssid=%s pass=%s ap=%d\n", toHex(apSsid).c_str(), toHex(apPass).c_str(),
+                  apEnabled ? 1 : 0);
+    return;
+  }
+
+  if (line.startsWith("PORTAL ")) {
+    // PORTAL <id> -> activate that portal (as if chosen on the display)
+    String id = line.substring(7);
+    for (int i = 0; i < nPortals; i++)
+      if (portals[i].id == id) { selectPortal(i); Serial.println("@OK"); return; }
+    Serial.println("@ERR Unknown portal");
     return;
   }
 
@@ -602,11 +760,16 @@ static void pollSerial() {
 
 // ---------------------------------------------------------------- setup / loop
 
+// Battery mode state (see updatePower)
+static unsigned long wakeUntil = 0;   // full brightness until then (PWR button or touch)
+static bool onBattery = false;
+
 void setup() {
   Serial.setRxBufferSize(4096);   // standaard 256 B: te klein voor FDATA-regels (~690 tekens)
   Serial.begin(115200);
   delay(500);
   Serial.println("\n[ESP32-Portal] start");
+  setCpuFrequencyMhz(CPU_MHZ);          // power saving (default 240 MHz)
 
   pinMode(RESET_BUTTON_PIN, INPUT_PULLUP);
   loadSettings();
@@ -617,6 +780,8 @@ void setup() {
     Serial.println("[FS] Note: /index.html is missing; upload a portal page with the admin app");
   }
 
+  loadPortals();
+  surveySetConfig(portalPath("survey.cfg"));
   surveyBegin();
   static const char *headerKeys[] = {"User-Agent"};
   server.collectHeaders(headerKeys, 1);
@@ -637,6 +802,7 @@ void setup() {
 
   displayBegin();
   pmuBegin();
+  wakeUntil = millis() + WAKE_SECONDS * 1000UL;   // start with a bright display
 }
 
 static PowerStatus powerNow = {false, -1, 0, false, false, 0, 0, "n/a"};
@@ -648,7 +814,11 @@ static void updateDisplay(bool force = false) {
 
   PortalStatus s;
   s.online = apRunning && (WiFi.getMode() & WIFI_AP);
-  s.ssid = apSsid;
+  s.ssid = effectiveSsid();
+  s.portalNames = portalNames;
+  s.portalCount = nPortals;
+  s.portalActive = activePortal;
+  s.portalRev = portalRev;
   s.open = apPass.isEmpty();
   s.clients = s.online ? WiFi.softAPgetStationNum() : 0;
   s.ip = apIP.toString();
@@ -658,25 +828,33 @@ static void updateDisplay(bool force = false) {
   s.votes = surveyVotes();
   s.average = surveyAverage();
   s.summary = surveySummary();
-  s.battery = powerNow.battery ? powerNow.percent : -1;
+  s.txPercent = TX_PCT[txLevel];
+  // On battery the percentage is shown in steps of 5: fewer full-screen redraws
+  int pct = powerNow.percent;
+  if (powerNow.battery && !powerNow.charging) pct = min(100, (pct + 2) / 5 * 5);
+  s.battery = powerNow.battery ? pct : -1;
   s.charging = powerNow.battery && powerNow.charging;
   displayUpdate(s);
 }
 
-// Battery mode: dim the display when running on battery; the PWR button
-// wakes it to full brightness for WAKE_SECONDS.
+// Battery mode: full brightness for WAKE_SECONDS after a touch or the PWR button,
+// then dimmed, and after SCREEN_OFF_SECONDS more the display switches off.
+
 static void updatePower() {
   static unsigned long lastPmu = 0;
-  static unsigned long wakeUntil = 0;
   if (lastPmu == 0 || millis() - lastPmu > 2000) {   // power source / battery every 2 s
     lastPmu = millis();
     powerNow = pmuStatus();
   }
   if (pmuButtonPressed()) wakeUntil = millis() + WAKE_SECONDS * 1000UL;
 
-  bool onBattery = powerNow.battery && !powerNow.usb;
-  bool awake = (long)(wakeUntil - millis()) > 0;
-  displaySetBrightness(onBattery && !awake ? DIM_BRIGHTNESS : DISPLAY_BRIGHTNESS);
+  bool battery = powerNow.battery && !powerNow.usb;
+  if (battery && !onBattery) wakeUntil = millis() + WAKE_SECONDS * 1000UL;   // just unplugged
+  onBattery = battery;
+  long left = (long)(wakeUntil - millis());                 // > 0: full brightness
+  bool screenOn = !onBattery || left > -(long)(SCREEN_OFF_SECONDS * 1000UL);
+  displaySetPower(screenOn);
+  displaySetBrightness(onBattery && left <= 0 ? DIM_BRIGHTNESS : DISPLAY_BRIGHTNESS);
 }
 
 void loop() {
@@ -687,10 +865,21 @@ void loop() {
   checkResetButton();
   pollSerial();
   updatePower();
-  if (displayPollTap()) {          // tik op de netwerkkaart = netwerk aan/uit
+  Tap tap = displayPollTap();
+  if (tap.touched) {                       // touching keeps a dimmed (battery) display bright
+    wakeUntil = millis() + WAKE_SECONDS * 1000UL;
+    updatePower();
+  }
+  if (tap.type == TAP_TXPOWER) {          // TX-knop: 25 -> 50 -> 75 -> 100%
+    cycleTxPower();
+    updateDisplay(true);
+  } else if (tap.type == TAP_NETWORK) {   // tik op de netwerkkaart = netwerk aan/uit
     setApEnabled(!apEnabled);
+    updateDisplay(true);
+  } else if (tap.type == TAP_PORTAL) {    // portal gekozen in de lijst
+    selectPortal(tap.index);
     updateDisplay(true);
   }
   updateDisplay();
-  delay(2);
+  delay(onBattery ? 10 : 2);   // on battery the CPU idles more between rounds
 }

@@ -12,4 +12,5 @@ Portal Admin.exe
 # Personal settings and content (stay on your own machine)
 include/config_local.h
 admin/portal_content.json
+admin/portal_content.backup.json
 admin/portal_assets/

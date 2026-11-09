@@ -5,6 +5,7 @@ Requires Python 3 with pyserial (python -m pip install --user pyserial).
 """
 
 import base64
+import copy
 import sys
 import csv
 import hashlib
@@ -13,13 +14,17 @@ import io
 import json
 import os
 import queue
+import re
 import shutil
 import tempfile
+import zipfile
 import threading
 import time
 import tkinter as tk
 import webbrowser
-from tkinter import colorchooser, filedialog, messagebox, ttk
+from tkinter import filedialog, messagebox, simpledialog, ttk
+
+import portal_editor as pe
 
 try:
     import serial
@@ -52,9 +57,10 @@ FONT = "Segoe UI"
 ESPRESSIF_VID = 0x303A
 BAUD = 115200
 CHUNK = 512                       # bytes per FDATA-regel
-MAX_IMAGE_BYTES = 2 * 1024 * 1024  # LittleFS-partitie is ± 3,4 MB
 
-if getattr(sys, "frozen", False):
+if os.environ.get("PORTAL_ADMIN_DIR"):          # testing with a separate content folder
+    HERE = os.environ["PORTAL_ADMIN_DIR"]
+elif getattr(sys, "frozen", False):
     # Running as "Portal Admin.exe" (PyInstaller): keep the editor content in
     # the admin folder next to the exe, not in the temporary unpack folder.
     _exe_dir = os.path.dirname(sys.executable)
@@ -66,14 +72,20 @@ ASSETS_DIR = os.path.join(HERE, "portal_assets")
 
 DEFAULT_CONTENT = {
     "title": "Welcome",
-    "heading": "Welcome",
-    "text": "You are connected to this local WiFi network.\n\nThis page is stored on the device itself; there is no internet connection.",
     "footer": "",
-    "image": "",
     "bg": "#121212",
     "card": "#1E1E1E",
     "fg": "#E1E1E1",
     "accent": "#9C89D7",
+    "font": "sans",
+    "layout": "card",
+    "width": "normal",
+    "blocks": [
+        {"type": "heading", "text": "Welcome", "size": "l", "align": "left"},
+        {"type": "text", "align": "left",
+         "html": "<p>You are connected to this local WiFi network.</p>"
+                 "<p>This page is stored on the device itself; there is no internet connection.</p>"},
+    ],
     # survey
     "survey_on": False,
     "survey_type": "stars",
@@ -81,14 +93,19 @@ DEFAULT_CONTENT = {
     "survey_yes": "Yes",
     "survey_no": "No",
     "survey_choices": ["Option A", "Option B", "", ""],
+    "survey_placeholder": "Type your answer here",
     "thanks_heading": "Thank you!",
     "thanks_text": "Your answer has been saved.",
 }
 
-IMAGE_TYPES = {".png": "/image.png", ".jpg": "/image.jpg", ".jpeg": "/image.jpg"}
 
-SURVEY_TYPES = [("stars", "Star rating (1–5)"), ("yesno", "Yes / No"), ("choice", "Multiple choice (2–4)")]
+SURVEY_TYPES = [("stars", "Star rating (1–5)"), ("yesno", "Yes / No"), ("choice", "Multiple choice (2–4)"),
+                ("open", "Open question (text, max. 240 characters)")]
+OPEN_MAX = 240          # must match SURVEY_MAX_TEXT in the firmware
 SURVEY_LOG = "/responses.csv"
+BOARD_CONTENT = "/portal.json"      # page + survey settings, so another PC can download them
+SURVEY_KEYS = ("survey_on", "survey_type", "survey_question", "survey_yes", "survey_no", "survey_choices",
+               "survey_placeholder", "thanks_heading", "thanks_text")
 
 
 # =========================================================================== serieel
@@ -151,6 +168,43 @@ class Board:
         if not reply.startswith("OK"):
             raise RuntimeError(reply[4:] if reply.startswith("ERR") else reply)
 
+    def list_files(self):
+        """{name: size} of the files on the board, or None for firmware without FLIST."""
+        reply = self.cmd("FLIST")
+        if not reply.startswith("FLIST"):
+            return None
+        files = {}
+        for part in reply.split()[1:]:
+            name, _, size = part.rpartition(":")
+            if name:
+                files[name.lstrip("/")] = int(size or 0)
+        return files
+
+    def wifi(self):
+        """{"ssid", "pass", "ap"} from the board, or None for firmware older than 2.5."""
+        reply = self.cmd("WIFI")
+        if not reply.startswith("WIFI"):
+            return None
+        vals = dict(part.partition("=")[::2] for part in reply.split()[1:])
+        return {"ssid": from_hex(vals.get("ssid", "")), "pass": from_hex(vals.get("pass", "")),
+                "ap": vals.get("ap", "1") == "1"}
+
+    def get_file(self, path, progress=None):
+        """Contents of a file on the board (b"" when it does not exist)."""
+        data = b""
+        while True:
+            reply = self.cmd(f"FREAD {path} {len(data)}")
+            if reply.startswith("EOF"):
+                return data
+            if not reply.startswith("DATA"):
+                raise RuntimeError(reply[4:] if reply.startswith("ERR") else reply)
+            chunk = base64.b64decode(reply[5:].strip())
+            if not chunk:
+                return data
+            data += chunk
+            if progress:
+                progress(len(data))
+
     def put_file(self, path, data, progress=None):
         self.ok(f"FBEGIN {path} {len(data)}")
         try:
@@ -186,23 +240,130 @@ def parse_info(reply):
 
 # =========================================================================== portal-inhoud
 
-def load_content():
-    content = dict(DEFAULT_CONTENT)
-    try:
-        with open(CONTENT_FILE, encoding="utf-8") as f:
-            content.update(json.load(f))
-    except (OSError, ValueError):
-        pass
+def content_from(saved):
+    """Complete, validated content from a saved dict (local file or the board's copy)."""
+    content = copy.deepcopy(DEFAULT_CONTENT)
+    if isinstance(saved, dict):
+        if "blocks" not in saved:
+            content.pop("blocks")          # old file: build blocks from heading/text/image
+        content.update(saved)
+    pe.migrate(content)
+    for old in ("heading", "text", "image"):
+        content.pop(old, None)
+    content.update(pe.normalize_edit(content, DEFAULT_CONTENT))
+    if content["survey_type"] not in dict(SURVEY_TYPES):
+        content["survey_type"] = "stars"
+    content["survey_on"] = bool(content["survey_on"])
+    for key in SURVEY_KEYS[2:]:
+        if key != "survey_choices":
+            content[key] = str(content.get(key) or "")[:300]
+    choices = content["survey_choices"] if isinstance(content["survey_choices"], list) else []
+    content["survey_choices"] = ([str(x)[:100] for x in choices] + [""] * 4)[:4]
     return content
 
 
-def save_content(content):
-    with open(CONTENT_FILE, "w", encoding="utf-8") as f:
-        json.dump(content, f, ensure_ascii=False, indent=2)
+# --- portals (profiles): the store holds up to MAX_PORTALS portals, each a full content dict
+#     plus "id" (4 hex), "name" and "ssid" (empty = the general network name)
+MAX_PORTALS = 8          # must match MAX_PORTALS in the firmware
+PORTAL_ID_RE = re.compile(r"^[0-9a-f]{4}$")
+PORTAL_FILE_RE = re.compile(r"^p-[0-9a-f]{4}-(index\.html|thanks\.html|survey\.cfg)$")
+PORTAL_KEYS = ("id", "name", "ssid")
 
 
-def image_path(content):
-    return os.path.join(ASSETS_DIR, content["image"]) if content.get("image") else ""
+def new_portal_id(taken):
+    while True:
+        pid = os.urandom(2).hex()
+        if pid not in taken:
+            return pid
+
+
+def clean_ssid(text):
+    text = clean_line(text)
+    while len(text.encode("utf-8")) > 32:
+        text = text[:-1]
+    return text
+
+
+def portal_from(saved, taken=(), name="Portal 1"):
+    """One validated portal; gets a new id when it has none (or a duplicate one)."""
+    p = content_from(saved)
+    pid = p.get("id")
+    p["id"] = pid if isinstance(pid, str) and PORTAL_ID_RE.match(pid) and pid not in taken else new_portal_id(taken)
+    p["name"] = clean_line(p.get("name") or name)[:40] or name
+    p["ssid"] = clean_ssid(p.get("ssid") or "")
+    for key in ("board_files", "synced_hash", "portals", "current"):   # store-level keys
+        p.pop(key, None)
+    return p
+
+
+def store_from(saved):
+    """Validated store from the local file or the board's copy (also the old single-page format)."""
+    store = {"portals": []}
+    if isinstance(saved, dict) and isinstance(saved.get("portals"), list):
+        items = saved["portals"][:MAX_PORTALS]
+    else:
+        # single page from app versions before portals; a fixed id, so the copy on this PC and
+        # the one on the board (both migrated separately) still compare equal
+        items = [dict(saved, id=saved.get("id") or "0001") if isinstance(saved, dict) else saved]
+    for i, item in enumerate(items):
+        store["portals"].append(portal_from(item, {q["id"] for q in store["portals"]}, f"Portal {i + 1}"))
+    if not store["portals"]:
+        store["portals"].append(portal_from(None))
+    ids = [q["id"] for q in store["portals"]]
+    if isinstance(saved, dict):
+        store["current"] = saved.get("current") if saved.get("current") in ids else ids[0]
+        store["board_files"] = [n for n in saved.get("board_files", []) if isinstance(n, str)]
+        if isinstance(saved.get("synced_hash"), str):
+            store["synced_hash"] = saved["synced_hash"]
+    else:
+        store["current"] = ids[0]
+    return store
+
+
+def load_store():
+    try:
+        with open(CONTENT_FILE, encoding="utf-8") as f:
+            return store_from(json.load(f))
+    except (OSError, ValueError):
+        return store_from(None)
+
+
+def page_data(c):
+    """One portal as stored on the board: page, survey, name and network name."""
+    return {k: c.get(k) for k in pe.EDIT_KEYS + SURVEY_KEYS + PORTAL_KEYS}
+
+
+def store_data(store):
+    return {"portals": [page_data(p) for p in store["portals"]]}
+
+
+def store_hash(store):
+    raw = json.dumps(store_data(store), sort_keys=True, ensure_ascii=False).encode("utf-8")
+    return hashlib.sha1(raw).hexdigest()[:16]
+
+
+def save_store(store):
+    tmp = CONTENT_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(store, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, CONTENT_FILE)
+
+
+def all_images(store):
+    out = []
+    for p in store["portals"]:
+        for n in pe.used_files(p["blocks"]):
+            if n not in out:
+                out.append(n)
+    return out
+
+
+def portals_cfg(store):
+    return "".join(f"{p['id']}\t{clean_line(p['name'])}\t{p['ssid']}\n" for p in store["portals"])
+
+
+def asset_path(name):
+    return os.path.join(ASSETS_DIR, name)
 
 
 def clean_line(text):
@@ -214,17 +375,20 @@ def survey_options(c):
         return ["1", "2", "3", "4", "5"]
     if c["survey_type"] == "yesno":
         return [clean_line(c["survey_yes"]) or "Yes", clean_line(c["survey_no"]) or "No"]
+    if c["survey_type"] == "open":
+        return []
     return [clean_line(o) for o in c["survey_choices"] if clean_line(o)][:4]
 
 
 def survey_id(c):
+    """<portal id>-<hash of the question>: answers can be traced back to their portal."""
     key = "\n".join([c["survey_type"], clean_line(c["survey_question"])] + survey_options(c))
-    return hashlib.md5(key.encode("utf-8")).hexdigest()[:8]
+    return f"{c.get('id', 'xxxx')}-{hashlib.md5(key.encode('utf-8')).hexdigest()[:8]}"
 
 
 def survey_cfg(c):
     return (f"{survey_id(c)}\n{c['survey_type']}\n{clean_line(c['survey_question'])}\n"
-            + "\t".join(survey_options(c)) + "\n")
+            + ("\t".join(survey_options(c)) or clean_line(c.get("survey_placeholder", ""))) + "\n")
 
 
 def on_color(hex_color):
@@ -242,6 +406,8 @@ TIME_SCRIPT = ("<script>(function(){var d=new Date(),p=function(n){return(n<10?'
                "var t=document.getElementById('t');if(t)t.value=d.getFullYear()+'-'+p(d.getMonth()+1)+'-'"
                "+p(d.getDate())+' '+p(d.getHours())+':'+p(d.getMinutes())+':'+p(d.getSeconds());"
                "var f=document.querySelector('form.survey');if(!f)return;"
+               "var a=f.querySelector('textarea'),n=f.querySelector('.cnt');"
+               "if(a&&n)a.addEventListener('input',function(){n.textContent=a.value.length+' / '+a.maxLength;});"
                "f.addEventListener('submit',function(){setTimeout(function(){"
                "var b=f.querySelectorAll('button');for(var i=0;i<b.length;i++)b[i].disabled=true;},0);});"
                "fetch('/voted',{cache:'no-store'}).then(function(r){return r.json();}).then(function(j){"
@@ -252,6 +418,11 @@ TIME_SCRIPT = ("<script>(function(){var d=new Date(),p=function(n){return(n<10?'
 def _page(c, inner, footer="", script=""):
     esc = html.escape
     acc, on_acc = c["accent"], on_color(c["accent"])
+    font = pe.FONTS.get(c.get("font"), pe.FONTS["sans"])
+    width = pe.WIDTHS.get(c.get("width"), 560)
+    flat = c.get("layout") == "flat"
+    card_css = (f"background:{c['bg']};padding:8px 4px" if flat else
+                f"background:{c['card']};border-radius:16px;padding:28px 24px;box-shadow:0 2px 12px rgba(0,0,0,.25)")
     return f"""<!doctype html>
 <html lang="en">
 <head>
@@ -260,12 +431,12 @@ def _page(c, inner, footer="", script=""):
 <title>{esc(c['title'])}</title>
 <style>
 *{{box-sizing:border-box}}
-body{{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+body{{margin:0;font-family:{font};
 background:{c['bg']};color:{c['fg']};line-height:1.55}}
-main{{max-width:560px;margin:0 auto;padding:32px 16px}}
-.card{{background:{c['card']};border-radius:16px;padding:28px 24px;box-shadow:0 2px 12px rgba(0,0,0,.25)}}
-.hero{{display:block;max-width:100%;height:auto;margin:0 auto 20px;border-radius:12px}}
+main{{max-width:{width}px;margin:0 auto;padding:32px 16px}}
+.card{{{card_css}}}
 h1{{margin:0 0 12px;font-size:28px;color:{acc}}}
+{pe.blocks_css(c)}
 p{{margin:0 0 12px}}p:last-child{{margin-bottom:0}}
 footer{{text-align:center;font-size:13px;opacity:.7;padding:20px 16px 0}}
 .survey{{margin-top:22px;padding-top:20px;border-top:1px solid rgba(127,127,127,.25)}}
@@ -277,6 +448,12 @@ footer{{text-align:center;font-size:13px;opacity:.7;padding:20px 16px 0}}
 .opts{{display:flex;flex-wrap:wrap;gap:10px}}
 .opts button{{flex:1 1 40%;min-height:50px;padding:12px;border:0;border-radius:12px;background:{acc};
 color:{on_acc};font-size:17px;font-weight:600;cursor:pointer}}
+.open textarea{{display:block;width:100%;min-height:110px;padding:12px;border-radius:12px;font:inherit;font-size:16px;
+color:inherit;background:rgba(127,127,127,.12);border:1px solid rgba(127,127,127,.35);resize:vertical}}
+.open textarea:focus{{outline:none;border-color:{acc}}}
+.cnt{{text-align:right;font-size:12px;opacity:.6;margin:4px 0 10px}}
+.send{{width:100%;min-height:50px;border:0;border-radius:12px;background:{acc};color:{on_acc};
+font-size:17px;font-weight:600;cursor:pointer}}
 .privacy{{font-size:12px;opacity:.6;margin:14px 0 0 !important}}
 .back{{display:inline-block;margin-top:8px;color:{acc};font-weight:600}}
 </style>
@@ -302,24 +479,28 @@ def render_survey(c):
             f'<button type="submit" name="a" value="{i}" aria-label="{i} star{"s" if i > 1 else ""}">&#9733;</button>'
             for i in range(5, 0, -1))
         block = f'<div class="stars">{buttons}</div><div class="scale"><span>1</span><span>5</span></div>'
+    elif c["survey_type"] == "open":
+        block = (f'<div class="open"><textarea name="txt" maxlength="{OPEN_MAX}" required '
+                 f'placeholder="{esc(c.get("survey_placeholder", ""))}" aria-label="Your answer"></textarea>'
+                 f'<div class="cnt">0 / {OPEN_MAX}</div><button type="submit" class="send">Send</button></div>')
     else:
         block = '<div class="opts">' + "".join(
             f'<button type="submit" name="a" value="{i + 1}">{esc(o)}</button>' for i, o in enumerate(opts)) + "</div>"
-    return (f'<form class="survey" method="post" action="/answer">'
+    privacy = "Your answer is stored anonymously."
+    if c["survey_type"] == "open":
+        privacy += " Please do not include your name or other personal details."
+    return (f'<form class="survey" method="post" action="/answer" accept-charset="utf-8">'
             f'<p class="q">{esc(c["survey_question"])}</p>{block}'
             f'<input type="hidden" name="t" id="t">'
-            f'<p class="privacy">Your answer is stored anonymously.</p></form>')
+            f'<p class="privacy">{privacy}</p></form>')
 
 
-def render_html(c, image_url=""):
+def render_html(c):
+    """Landing page; images are referenced by their plain file name (same folder)."""
     esc = html.escape
-    paragraphs = [p.strip() for p in c["text"].split("\n\n") if p.strip()]
-    body = "\n".join(f"<p>{esc(p).replace(chr(10), '<br>')}</p>" for p in paragraphs)
-    img = f'<img class="hero" src="{esc(image_url)}" alt="">' if image_url else ""
     footer = f"<footer>{esc(c['footer'])}</footer>" if c.get("footer", "").strip() else ""
-    heading = f"<h1>{esc(c['heading'])}</h1>" if c["heading"].strip() else ""
     survey = render_survey(c) if c.get("survey_on") else ""
-    return _page(c, f"{img}\n{heading}\n{body}\n{survey}", footer, TIME_SCRIPT if survey else "")
+    return _page(c, f"{pe.render_blocks(c)}\n{survey}", footer, TIME_SCRIPT if survey else "")
 
 
 def render_thanks(c):
@@ -334,6 +515,71 @@ def render_thanks(c):
     return _page(c, inner, script=script)
 
 
+# =========================================================================== backup
+
+BACKUP_FORMAT = 1
+MAX_BACKUP_LOG = 3 * 1024 * 1024
+
+
+def merge_logs(*logs):
+    """Survey logs combined: one header, every answer once, in order."""
+    header, seen, out = None, set(), []
+    for data in logs:
+        lines = data.decode("utf-8", errors="replace").splitlines()
+        if not lines:
+            continue
+        header = header or lines[0]
+        for line in lines[1:]:
+            if line.strip() and line not in seen:
+                seen.add(line)
+                out.append(line)
+    return ("\n".join([header] + out) + "\n").encode("utf-8") if header else b""
+
+
+def write_backup(path, store, board, log):
+    """board: {"fw", "wifi", "active_portal"} or None (PC only)."""
+    with zipfile.ZipFile(path, "w", zipfile.ZIP_DEFLATED) as z:
+        meta = {"format": BACKUP_FORMAT, "app": "Portal Admin", "created": time.strftime("%Y-%m-%d %H:%M:%S"),
+                "board": board, "answers": max(0, len(log.splitlines()) - 1) if log else 0}
+        z.writestr("backup.json", json.dumps(meta, ensure_ascii=False, indent=2))
+        z.writestr("portals.json", json.dumps(dict(store_data(store), current=store["current"]),
+                                              ensure_ascii=False, indent=2))
+        for name in all_images(store):
+            if os.path.exists(asset_path(name)):
+                z.write(asset_path(name), "images/" + name)
+        if log:
+            z.writestr("responses.csv", log)
+
+
+def read_backup(path):
+    """(meta, store, images {name: bytes}, log bytes); raises ValueError for an invalid file."""
+    try:
+        with zipfile.ZipFile(path) as z:
+            names = set(z.namelist())
+            if "backup.json" not in names or "portals.json" not in names:
+                raise ValueError("This is not a Portal Admin backup.")
+            meta = json.loads(z.read("backup.json"))
+            if meta.get("format") != BACKUP_FORMAT:
+                raise ValueError("This backup was made with another version of Portal Admin.")
+            store = store_from(json.loads(z.read("portals.json")))
+            images = {}
+            for name in all_images(store):
+                info = z.getinfo("images/" + name) if "images/" + name in names else None
+                if info is None or info.file_size > pe.MAX_IMAGE_BYTES:
+                    continue
+                data = z.read(info)
+                if pe.image_ext(data):
+                    images[name] = data
+            log = b""
+            if "responses.csv" in names and z.getinfo("responses.csv").file_size <= MAX_BACKUP_LOG:
+                log = z.read("responses.csv")
+                if not log.startswith(b"survey_id,"):
+                    log = b""
+            return meta, store, images, log
+    except (zipfile.BadZipFile, KeyError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"The backup file is damaged ({exc}).") from exc
+
+
 # =========================================================================== UI
 
 class App(tk.Tk):
@@ -343,8 +589,16 @@ class App(tk.Tk):
         self.configure(bg=BG)
         self.busy = False
         self.has_password = False
-        self.content = load_content()
-        self.thumb = None
+        self.had_local_file = os.path.exists(CONTENT_FILE)
+        self.store = load_store()
+        self.content = self._current_portal()   # the portal being edited (editor + Survey tab)
+        self.board_portal = None                # id of the portal active on the board
+        self.synced_ports = set()         # ports whose page was compared with this PC this session
+        self.lock = threading.RLock()     # content is shared with the editor's web server
+        self.rev = 1                      # bumped on every content change
+        self.status_kind = "idle"
+        self.calls = queue.Queue()        # callables from other threads, run on the Tk thread
+        self.editor = None
 
         self._style()
         self._build()
@@ -355,6 +609,22 @@ class App(tk.Tk):
         self.geometry(f"{w}x{h}")
         self.minsize(w, h)
         self.after(100, self.refresh_ports)
+        self.after(150, self._run_calls)
+
+    def _current_portal(self):
+        return next(q for q in self.store["portals"] if q["id"] == self.store["current"])
+
+    def _save(self):
+        with self.lock:
+            save_store(self.store)
+
+    def _run_calls(self):
+        try:
+            while True:
+                self.calls.get_nowait()()
+        except queue.Empty:
+            pass
+        self.after(150, self._run_calls)
 
     # ------------------------------------------------------------ opmaak
     def _style(self):
@@ -440,13 +710,36 @@ class App(tk.Tk):
                  anchor="w", justify="left", wraplength=420).pack(side="left", padx=(8, 0), fill="x")
         self.progress = ttk.Progressbar(conn, mode="determinate", style="Horizontal.TProgressbar")
 
+        # Portal (profile) being edited
+        bar = tk.Frame(self, bg=CARD, padx=20, pady=12)
+        bar.pack(fill="x", padx=16, pady=(0, 16))
+        self._label(bar, "PORTAL", bold=True, color=PRIMARY, size=8).pack(fill="x")
+        prow = tk.Frame(bar, bg=CARD)
+        prow.pack(fill="x", pady=(4, 0))
+        self.portal_var = tk.StringVar()
+        self.portal_box = ttk.Combobox(prow, textvariable=self.portal_var, state="readonly", font=(FONT, 10))
+        self.portal_box.pack(side="left", fill="x", expand=True)
+        self.portal_box.bind("<<ComboboxSelected>>", lambda e: self.switch_portal(self.portal_box.current()))
+        self._ghost(prow, "Rename", self.rename_portal, small=True).pack(side="left", padx=(8, 0))
+        self._ghost(prow, "New", self.new_portal, small=True).pack(side="left", padx=(6, 0))
+        self._ghost(prow, "Duplicate", self.duplicate_portal, small=True).pack(side="left", padx=(6, 0))
+        self._ghost(prow, "Delete", self.delete_portal, fg=SECONDARY, small=True).pack(side="left", padx=(6, 0))
+        arow = tk.Frame(bar, bg=CARD)
+        arow.pack(fill="x", pady=(8, 0))
+        self.portal_hint = self._label(arow, "", color=MUTED, size=9)
+        self.portal_hint.pack(side="left", fill="x", expand=True)
+        self.activate_btn = self._ghost(arow, "Make active on ESP32", self.activate_portal, small=True)
+        self.activate_btn.pack(side="right")
+
         nb = ttk.Notebook(self)
         nb.pack(fill="both", expand=True, padx=16, pady=(0, 16))
         nb.add(self._build_wifi(nb), text="WiFi")
         nb.add(self._build_portal(nb), text="Portal")
         nb.add(self._build_survey(nb), text="Survey")
         nb.add(self._build_results(nb), text="Results")
-        self.action_buttons = [self.save_btn, self.upload_btn, self.survey_upload_btn, self.results_btn]
+        nb.add(self._build_backup(nb), text="Backup")
+        self.action_buttons = [self.save_btn, self.upload_btn, self.survey_upload_btn, self.results_btn,
+                               self.activate_btn, self.backup_btn, self.restore_btn]
 
     def _build_wifi(self, parent):
         tab = tk.Frame(parent, bg=CARD, padx=20, pady=18)
@@ -495,62 +788,42 @@ class App(tk.Tk):
         tab = tk.Frame(parent, bg=CARD, padx=20, pady=18)
 
         grid = tk.Frame(tab, bg=CARD)
-        grid.pack(fill="x")
+        grid.pack(fill="x", pady=(0, 14))
         grid.columnconfigure(0, weight=1)
         grid.columnconfigure(1, weight=1)
-        self.title_var = tk.StringVar()
-        self.heading_var = tk.StringVar()
-        self._label(grid, "Heading").grid(row=0, column=0, sticky="w", pady=(0, 4))
-        self._label(grid, "Page title (browser tab)").grid(row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
-        ttk.Entry(grid, textvariable=self.heading_var, font=(FONT, 10)).grid(row=1, column=0, sticky="ew")
-        ttk.Entry(grid, textvariable=self.title_var, font=(FONT, 10)).grid(row=1, column=1, sticky="ew", padx=(10, 0))
+        self.pname_var, self.pssid_var = tk.StringVar(), tk.StringVar()
+        self._label(grid, "Portal name (shown on the ESP32 display)").grid(row=0, column=0, sticky="w", pady=(0, 4))
+        self._label(grid, "Network name for this portal (optional)").grid(
+            row=0, column=1, sticky="w", padx=(10, 0), pady=(0, 4))
+        name_entry = ttk.Entry(grid, textvariable=self.pname_var, font=(FONT, 10))
+        name_entry.grid(row=1, column=0, sticky="ew")
+        name_entry.bind("<FocusOut>", lambda e: self._collect())
+        name_entry.bind("<Return>", lambda e: self._collect())
+        ssid_entry = ttk.Entry(grid, textvariable=self.pssid_var, font=(FONT, 10))
+        ssid_entry.grid(row=1, column=1, sticky="ew", padx=(10, 0))
+        ssid_entry.bind("<FocusOut>", lambda e: self._collect())
+        self._label(grid, "Empty network name = the name from the WiFi tab.", color=MUTED, size=9).grid(
+            row=2, column=1, sticky="w", padx=(10, 0), pady=(4, 0))
 
-        self._label(tab, "Text  (empty line = new paragraph)").pack(fill="x", pady=(12, 4))
-        self.text_box = tk.Text(tab, height=6, wrap="word", font=(FONT, 10), relief="flat", bd=0,
-                                bg=SURFACE2, fg=TEXT, insertbackground=TEXT, selectbackground=PRIMARY,
-                                selectforeground=ON_PRIMARY, highlightthickness=1,
-                                highlightbackground=OUTLINE, highlightcolor=PRIMARY, padx=8, pady=6)
-        self.text_box.pack(fill="x")
+        box = tk.Frame(tab, bg=SURFACE2, padx=16, pady=14)
+        box.pack(fill="x")
+        self._label(box, "Landing page", bold=True, size=12, bg=SURFACE2).pack(fill="x")
+        self.page_summary = self._label(box, "", color=MUTED, size=9, bg=SURFACE2)
+        self.page_summary.pack(fill="x", pady=(2, 0))
+        self.page_colors = tk.Frame(box, bg=SURFACE2)
+        self.page_colors.pack(fill="x", pady=(10, 0))
 
-        self._label(tab, "Footer (optional)").pack(fill="x", pady=(12, 4))
-        self.footer_var = tk.StringVar()
-        ttk.Entry(tab, textvariable=self.footer_var, font=(FONT, 10)).pack(fill="x")
-
-        # Afbeelding
-        self._label(tab, "Image (PNG or JPG, top of the page)").pack(fill="x", pady=(12, 4))
-        img_row = tk.Frame(tab, bg=CARD)
-        img_row.pack(fill="x")
-        self.thumb_label = tk.Label(img_row, bg=SURFACE2, width=12, height=5, text="none",
-                                    fg=MUTED, font=(FONT, 9))
-        self.thumb_label.pack(side="left")
-        img_btns = tk.Frame(img_row, bg=CARD)
-        img_btns.pack(side="left", padx=(12, 0), fill="x", expand=True)
-        self.image_info = self._label(img_btns, "", color=MUTED, size=9)
-        self.image_info.pack(fill="x")
-        b = tk.Frame(img_btns, bg=CARD)
-        b.pack(fill="x", pady=(6, 0))
-        self._ghost(b, "Choose image…", self.pick_image, small=True).pack(side="left")
-        self._ghost(b, "Remove", self.remove_image, fg=SECONDARY, small=True).pack(side="left", padx=(8, 0))
-
-        # Kleuren
-        self._label(tab, "Colours").pack(fill="x", pady=(12, 4))
-        colors = tk.Frame(tab, bg=CARD)
-        colors.pack(fill="x")
-        self.color_buttons = {}
-        for key, label in (("bg", "Background"), ("card", "Card"), ("fg", "Text"), ("accent", "Heading")):
-            cell = tk.Frame(colors, bg=CARD)
-            cell.pack(side="left", padx=(0, 14))
-            border = tk.Frame(cell, bg="#6A6A6A", padx=1, pady=1)   # zichtbare rand
-            border.pack(side="left")
-            sw = tk.Button(border, width=3, relief="flat", bd=0, cursor="hand2",
-                           command=lambda k=key: self.pick_color(k))
-            sw.pack()
-            self._label(cell, label, size=9).pack(side="left", padx=(6, 0))
-            self.color_buttons[key] = sw
+        self._button(tab, "Open page editor", self.open_editor, PRIMARY, active=PRIMARY_LIGHT).pack(
+            fill="x", pady=(14, 0))
+        self._label(tab, "The editor opens in its own window: headings, formatted text, images, "
+                         "galleries, highlights, colours and fonts, with a live preview. "
+                         "Changes are saved automatically. Large photos are resized for you.",
+                    color=MUTED, size=9).pack(fill="x", pady=(10, 0))
+        tab.bind("<Configure>", lambda e: self._wrap_labels(tab, e.width))
 
         actions = tk.Frame(tab, bg=CARD)
         actions.pack(side="bottom", fill="x", pady=(16, 0))
-        self.upload_btn = self._button(actions, "Upload portal to ESP32", self.upload_portal,
+        self.upload_btn = self._button(actions, "Upload all portals to ESP32", self.upload_portal,
                                        PRIMARY, active=PRIMARY_LIGHT)
         self.upload_btn.pack(fill="x")
         sub = tk.Frame(actions, bg=CARD)
@@ -594,6 +867,13 @@ class App(tk.Tk):
         for i, v in enumerate(self.choice_vars):
             ttk.Entry(self.choice_frame, textvariable=v, font=(FONT, 10)).grid(
                 row=i // 2, column=i % 2, sticky="ew", padx=(0 if i % 2 == 0 else 10, 0), pady=(0, 8))
+        self.placeholder_var = tk.StringVar()
+        self.open_frame = tk.Frame(self.options_frame, bg=CARD)
+        self._label(self.open_frame, "Hint text in the empty answer field", size=9).pack(fill="x", pady=(0, 4))
+        ttk.Entry(self.open_frame, textvariable=self.placeholder_var, font=(FONT, 10)).pack(fill="x")
+        self._label(self.open_frame, f"Visitors type an answer of up to {OPEN_MAX} characters. The answers "
+                                     "appear in the Results tab and in the CSV export.",
+                    color=MUTED, size=9).pack(fill="x", pady=(6, 0))
 
         self._label(tab, "Thank-you page").pack(fill="x", pady=(12, 4))
         grid = tk.Frame(tab, bg=CARD)
@@ -610,7 +890,7 @@ class App(tk.Tk):
 
         actions = tk.Frame(tab, bg=CARD)
         actions.pack(side="bottom", fill="x", pady=(16, 0))
-        self.survey_upload_btn = self._button(actions, "Upload portal + survey to ESP32", self.upload_portal,
+        self.survey_upload_btn = self._button(actions, "Upload all portals to ESP32", self.upload_portal,
                                               PRIMARY, active=PRIMARY_LIGHT)
         self.survey_upload_btn.pack(fill="x")
         sub = tk.Frame(actions, bg=CARD)
@@ -624,10 +904,11 @@ class App(tk.Tk):
                 w.configure(wraplength=max(200, width - 50), justify="left")
 
     def _show_option_fields(self):
-        for f in (self.stars_hint, self.yesno_frame, self.choice_frame):
+        for f in (self.stars_hint, self.yesno_frame, self.choice_frame, self.open_frame):
             f.pack_forget()
         t = self._survey_type_key()
-        {"stars": self.stars_hint, "yesno": self.yesno_frame, "choice": self.choice_frame}[t].pack(fill="x")
+        {"stars": self.stars_hint, "yesno": self.yesno_frame, "choice": self.choice_frame,
+         "open": self.open_frame}[t].pack(fill="x")
 
     def _survey_type_key(self):
         label = self.survey_type_var.get()
@@ -640,11 +921,18 @@ class App(tk.Tk):
         self.results_summary.pack(fill="x")
         self.results_detail = self._label(tab, "", color=MUTED, size=9)
         self.results_detail.pack(fill="x", pady=(2, 10))
+        frow = tk.Frame(tab, bg=CARD)
+        frow.pack(fill="x", pady=(0, 8))
+        self._label(frow, "Show", size=9).pack(side="left")
+        self.results_filter = tk.StringVar(value="All portals")
+        self.filter_box = ttk.Combobox(frow, textvariable=self.results_filter, state="readonly", width=30)
+        self.filter_box.pack(side="left", padx=(8, 0))
+        self.filter_box.bind("<<ComboboxSelected>>", lambda e: self._show_results())
 
         table = tk.Frame(tab, bg=CARD)
         table.pack(fill="both", expand=True)
-        cols = (("time", "Time", 130), ("device", "Device", 130), ("question", "Question", 150),
-                ("answer", "Answer", 80))
+        cols = (("time", "Time", 120), ("portal", "Portal", 90), ("device", "Device", 100),
+                ("question", "Question", 130), ("answer", "Answer", 80))
         self.tree = ttk.Treeview(table, columns=[c for c, _, _ in cols], show="headings", height=11)
         for key, title, width in cols:
             self.tree.heading(key, text=title, anchor="w")
@@ -652,6 +940,7 @@ class App(tk.Tk):
         sb = ttk.Scrollbar(table, orient="vertical", command=self.tree.yview)
         self.tree.configure(yscrollcommand=sb.set)
         self.tree.pack(side="left", fill="both", expand=True)
+        self.tree.bind("<Double-1>", self._show_answer)
         sb.pack(side="left", fill="y")
         self.log_rows = []
         self.log_raw = b""
@@ -667,8 +956,37 @@ class App(tk.Tk):
             side="left", fill="x", expand=True, padx=(8, 0))
         return tab
 
+    def _build_backup(self, parent):
+        tab = tk.Frame(parent, bg=CARD, padx=20, pady=18)
+        self._label(tab, "Backup", bold=True, size=12).pack(fill="x")
+        self._label(tab, "One file with everything you need to set up the portal again, for example after "
+                         "you installed another program on the ESP32:", color=MUTED, size=9).pack(fill="x", pady=(4, 8))
+        for line in ("all portals: pages, images, surveys and thank-you pages",
+                     "WiFi settings: network name, password, network on/off",
+                     "which portal is active",
+                     "all survey answers"):
+            self._label(tab, "  \u2022  " + line, size=10).pack(fill="x", pady=1)
+        self._label(tab, "Restoring puts everything back on this PC and on the connected ESP32 (first flash "
+                         "this firmware again). Answers already on the ESP32 are kept; the answers from the "
+                         "backup are added.", color=MUTED, size=9).pack(fill="x", pady=(12, 0))
+        self._label(tab, "The backup contains the WiFi password and survey answers. Store it in a safe place, "
+                         "not in a shared folder.", color=SECONDARY, size=9).pack(fill="x", pady=(10, 0))
+        tab.bind("<Configure>", lambda e: [w.configure(wraplength=max(200, e.width - 50), justify="left")
+                                           for w in tab.winfo_children() if isinstance(w, tk.Label)])
+
+        actions = tk.Frame(tab, bg=CARD)
+        actions.pack(side="bottom", fill="x", pady=(16, 0))
+        self.backup_btn = self._button(actions, "Create backup…", self.create_backup, PRIMARY,
+                                       active=PRIMARY_LIGHT)
+        self.backup_btn.pack(fill="x")
+        self.restore_btn = self._ghost(actions, "Restore backup…", self.restore_backup)
+        self.restore_btn.pack(fill="x", pady=(8, 0))
+        return tab
+
     # ------------------------------------------------------------ status / taken
     def set_status(self, text, color=IDLE):
+        self.status_kind = {PRIMARY: "busy", SUCCESS: "ok", SECONDARY: "err"}.get(color, "idle")
+        self.status_text = text           # plain copy for the editor's web server thread
         self.status_var.set(text)
         self.dot.itemconfigure(self.dot_id, fill=color)
 
@@ -696,6 +1014,8 @@ class App(tk.Tk):
                 while True:
                     item = q.get_nowait()
                     if item[0] == "progress":
+                        if item[1] > float(self.progress.cget("maximum")):
+                            self.progress.configure(maximum=item[1] * 1.2)
                         self.progress.configure(value=item[1])
                     else:
                         self._finish(done, item[1], item[2])
@@ -776,7 +1096,11 @@ class App(tk.Tk):
         self.info_var.set(f"IP {info.get('ip', '?')}  ·  {info.get('clients', '0')} connected device(s)"
                           f"  ·  firmware {info.get('fw', '?')}"
                           + (f"  ·  display {info['lcd']}" if "lcd" in info else "")
-                          + self._battery_text(info))
+                          + self._battery_text(info)
+                          + (f"  ·  WiFi power {info['txp']}%" if "txp" in info else ""))
+        self.board_portal = info.get("portal") if info.get("portal") not in (None, "-") else None
+        self.board_fw_portals = "portal" in info
+        self._refresh_portal_bar()
 
     @staticmethod
     def _battery_text(info):
@@ -804,11 +1128,95 @@ class App(tk.Tk):
         if not port:
             return
 
-        def done(info):
+        sync = port not in self.synced_ports      # once per session: fetch the board's page first
+
+        def work(_r):
+            with Board(port) as b:
+                info = parse_info(b.cmd("INFO"))
+                return info, (b.get_file(BOARD_CONTENT) if sync else None)
+
+        def done(result):
+            info, data = result
             self._show_info(info)
             self.set_status(f"Connected to {port}", SUCCESS)
+            if sync:
+                self.synced_ports.add(port)
+                self._sync_from_board(port, data)
 
-        self.run_bg(lambda _r: parse_info(send_command(port, "INFO")), done, f"Connecting to {port}…")
+        self.run_bg(work, done, f"Connecting to {port}…")
+
+    def _sync_from_board(self, port, data):
+        """Use the portals stored on the board, unless this PC has newer changes (then ask)."""
+        if not data:
+            self.set_status(f"Connected to {port}. The board has no page settings from this app yet; "
+                            "they are stored on the next upload.", SUCCESS)
+            return
+        try:
+            board = store_from(json.loads(data.decode("utf-8")))
+        except ValueError:
+            self.set_status("Connected, but the page settings on the board are unreadable.", SECONDARY)
+            return
+        self._collect()
+        with self.lock:
+            local = copy.deepcopy(self.store)
+        missing = [n for n in all_images(board) if pe.valid_file(n) and not os.path.exists(asset_path(n))]
+        if store_hash(board) == store_hash(local) and not missing:
+            with self.lock:
+                self.store["synced_hash"] = store_hash(local)
+                save_store(self.store)
+            self.set_status(f"Connected to {port}. The portals on this PC match the board.", SUCCESS)
+            return
+        local_edited = (self.had_local_file and store_hash(local) != local.get("synced_hash")
+                        and store_hash(local) != store_hash(store_from(None))
+                        and store_hash(local) != store_hash(board))
+        if local_edited and not messagebox.askyesno(
+                "Portals on the board",
+                "The board has different portals than this PC, and this PC has changes that "
+                "were not uploaded.\n\n"
+                "Yes: use the board's portals (the version on this PC is saved as a backup).\n"
+                "No: keep the version on this PC (upload it to replace the board's portals)."):
+            self.set_status(f"Connected to {port}. Kept the portals on this PC; they differ from the board.",
+                            SECONDARY)
+            return
+        if self.had_local_file and store_hash(local) != store_hash(board) and os.path.exists(CONTENT_FILE):
+            shutil.copyfile(CONTENT_FILE, os.path.join(HERE, "portal_content.backup.json"))
+
+        def work(report):
+            got = 0
+            with Board(port) as b:
+                for name in missing:
+                    start = got
+                    blob = b.get_file("/" + name, lambda n: report(start + n))
+                    if not blob:
+                        raise FileNotFoundError(f"Image {name} is missing on the board.")
+                    if not pe.image_ext(blob):
+                        raise ValueError(f"Image {name} on the board is damaged.")
+                    os.makedirs(ASSETS_DIR, exist_ok=True)
+                    with open(asset_path(name), "wb") as f:
+                        f.write(blob)
+                    got += len(blob)
+
+        def done(_):
+            with self.lock:
+                ids = [q["id"] for q in board["portals"]]
+                board["current"] = local["current"] if local["current"] in ids else ids[0]
+                board["board_files"] = all_images(board)
+                board["synced_hash"] = store_hash(board)
+                self.store = board
+                self.content = self._current_portal()
+                self.rev += 1
+                save_store(board)
+            self.had_local_file = True
+            self._load_editor()
+            n = len(board["portals"])
+            self.set_status(f"Connected to {port}. Downloaded {n} portal{'s' if n != 1 else ''} from the board"
+                            + (f" ({len(missing)} image(s))." if missing else "."), SUCCESS)
+
+        if missing:
+            self.run_bg(work, done, f"Downloading {len(missing)} image(s) from the board…",
+                        progress_total=max(1, 64 * 1024 * len(missing)))
+        else:
+            done(None)
 
     def _wait_for_restart(self, port):
         time.sleep(2.5)
@@ -874,17 +1282,111 @@ class App(tk.Tk):
 
         self.run_bg(work, done, "Factory reset…")
 
+    # ------------------------------------------------------------ portals
+    def _refresh_portal_bar(self):
+        names = []
+        for q in self.store["portals"]:
+            mark = "   ● active on ESP32" if q["id"] == self.board_portal else ""
+            names.append(f"{q['name']}{mark}")
+        self.portal_box["values"] = names
+        idx = [q["id"] for q in self.store["portals"]].index(self.store["current"])
+        self.portal_box.current(idx)
+        n = len(self.store["portals"])
+        on_board = next((q["name"] for q in self.store["portals"] if q["id"] == self.board_portal), None)
+        self.portal_hint.configure(
+            text=f"{n} portal{'s' if n != 1 else ''} (max. {MAX_PORTALS})  ·  "
+                 + (f"active on the ESP32: {on_board}" if on_board else "not on the ESP32 yet: upload to add")
+                 + "  ·  choose on the display with the PORTAL button")
+
+    def switch_portal(self, index):
+        if index < 0 or index >= len(self.store["portals"]):
+            return
+        self._collect()
+        with self.lock:
+            self.store["current"] = self.store["portals"][index]["id"]
+            self.content = self._current_portal()
+            self.rev += 1
+            save_store(self.store)
+        self._load_editor()
+
+    def _add_portal(self, portal):
+        if len(self.store["portals"]) >= MAX_PORTALS:
+            messagebox.showinfo("Portal Admin", f"You can have at most {MAX_PORTALS} portals.")
+            return
+        self._collect()
+        with self.lock:
+            self.store["portals"].append(portal)
+        self.switch_portal(len(self.store["portals"]) - 1)
+
+    def new_portal(self):
+        taken = {q["id"] for q in self.store["portals"]}
+        self._add_portal(portal_from(None, taken, f"Portal {len(self.store['portals']) + 1}"))
+
+    def duplicate_portal(self):
+        self._collect()
+        copy_ = copy.deepcopy(self.content)
+        copy_["id"] = new_portal_id({q["id"] for q in self.store["portals"]})
+        copy_["name"] = (copy_["name"] + " (copy)")[:40]
+        self._add_portal(copy_)
+
+    def rename_portal(self):
+        self._collect()
+        name = simpledialog.askstring("Rename portal", "New name for this portal (shown on the ESP32 display):",
+                                      initialvalue=self.content["name"], parent=self)
+        name = clean_line(name or "")[:40]
+        if not name or name == self.content["name"]:
+            return
+        self.pname_var.set(name)
+        self._collect()
+        self.set_status(f"Renamed to “{name}”. Upload all portals to show the new name on the ESP32.",
+                        SUCCESS)
+
+    def delete_portal(self):
+        if len(self.store["portals"]) == 1:
+            messagebox.showinfo("Portal Admin", "This is the only portal; it cannot be deleted.")
+            return
+        if not messagebox.askyesno("Delete portal",
+                                   f"Delete the portal “{self.content['name']}” from this PC?\n\n"
+                                   "It is removed from the ESP32 on the next upload. Survey answers stay in "
+                                   "the log."):
+            return
+        with self.lock:
+            idx = self.store["portals"].index(self.content)
+            self.store["portals"].pop(idx)
+            self.store["current"] = self.store["portals"][max(0, idx - 1)]["id"]
+            self.content = self._current_portal()
+            self.rev += 1
+            save_store(self.store)
+        self._load_editor()
+
+    def activate_portal(self):
+        port = self.port()
+        if not port:
+            self.set_status("Select a port first.", SECONDARY)
+            return
+        pid, name = self.content["id"], self.content["name"]
+
+        def work(_r):
+            with Board(port) as b:
+                reply = b.cmd(f"PORTAL {pid}", timeout=8)
+                if reply.startswith("ERR"):
+                    raise RuntimeError(f"“{name}” is not on the ESP32 yet. Upload all portals first."
+                                       if "Unknown portal" in reply else reply[4:])
+                return parse_info(b.cmd("INFO"))
+
+        def done(info):
+            self._show_info(info)
+            self.set_status(f"“{name}” is now active on the ESP32.", SUCCESS)
+
+        self.run_bg(work, done, f"Activating “{name}”…")
+
     # ------------------------------------------------------------ Portal-editor
     def _load_editor(self):
         c = self.content
-        self.title_var.set(c["title"])
-        self.heading_var.set(c["heading"])
-        self.footer_var.set(c.get("footer", ""))
-        self.text_box.delete("1.0", "end")
-        self.text_box.insert("1.0", c["text"])
-        for key, btn in self.color_buttons.items():
-            btn.configure(bg=c[key], activebackground=c[key])
-        self._update_thumb()
+        self.pname_var.set(c["name"])
+        self.pssid_var.set(c["ssid"])
+        self._refresh_portal_bar()
+        self._update_summary()
         self.survey_on_var.set(bool(c["survey_on"]))
         self.survey_type_var.set(dict(SURVEY_TYPES).get(c["survey_type"], SURVEY_TYPES[0][1]))
         self.survey_q_var.set(c["survey_question"])
@@ -892,161 +1394,350 @@ class App(tk.Tk):
         self.no_var.set(c["survey_no"])
         for v, val in zip(self.choice_vars, list(c["survey_choices"]) + [""] * 4):
             v.set(val)
+        self.placeholder_var.set(c.get("survey_placeholder", ""))
         self.thanks_h_var.set(c["thanks_heading"])
         self.thanks_t_var.set(c["thanks_text"])
         self._show_option_fields()
 
     def _collect(self):
-        c = self.content
-        c["title"] = self.title_var.get().strip() or "Welcome"
-        c["heading"] = self.heading_var.get().strip()
-        c["footer"] = self.footer_var.get().strip()
-        c["text"] = self.text_box.get("1.0", "end").strip()
-        c["survey_on"] = self.survey_on_var.get()
-        c["survey_type"] = self._survey_type_key()
-        c["survey_question"] = self.survey_q_var.get().strip()
-        c["survey_yes"] = self.yes_var.get().strip()
-        c["survey_no"] = self.no_var.get().strip()
-        c["survey_choices"] = [v.get().strip() for v in self.choice_vars]
-        c["thanks_heading"] = self.thanks_h_var.get().strip() or "Thank you!"
-        c["thanks_text"] = self.thanks_t_var.get().strip()
-        save_content(c)
-        return c
+        """Copy the survey fields into the content, save it and return a snapshot."""
+        with self.lock:
+            c = self.content
+            old = json.dumps(c, sort_keys=True)
+            c["name"] = clean_line(self.pname_var.get())[:40] or c["name"]
+            c["ssid"] = clean_ssid(self.pssid_var.get())
+            c["survey_on"] = self.survey_on_var.get()
+            c["survey_type"] = self._survey_type_key()
+            c["survey_question"] = self.survey_q_var.get().strip()
+            c["survey_yes"] = self.yes_var.get().strip()
+            c["survey_no"] = self.no_var.get().strip()
+            c["survey_choices"] = [v.get().strip() for v in self.choice_vars]
+            c["survey_placeholder"] = self.placeholder_var.get().strip()
+            c["thanks_heading"] = self.thanks_h_var.get().strip() or "Thank you!"
+            c["thanks_text"] = self.thanks_t_var.get().strip()
+            changed = json.dumps(c, sort_keys=True) != old
+            if changed:
+                self.rev += 1
+            save_store(self.store)
+            snapshot = copy.deepcopy(c)
+        if changed:
+            self._refresh_portal_bar()
+        return snapshot
 
-    def _update_thumb(self):
-        path = image_path(self.content)
-        if not path or not os.path.exists(path):
-            self.content["image"] = ""
-            self.thumb = None
-            self.thumb_label.configure(image="", text="none", width=12, height=5)
-            self.image_info.configure(text="No image selected.")
-            return
-        size_kb = os.path.getsize(path) / 1024
-        self.image_info.configure(text=f"{self.content['image']}  ·  {size_kb:.0f} kB")
-        try:
-            img = tk.PhotoImage(file=path)   # Tk leest PNG; JPG krijgt geen miniatuur
-            factor = max(1, -(-max(img.width(), img.height()) // 90))
-            self.thumb = img.subsample(factor, factor)
-            self.thumb_label.configure(image=self.thumb, text="", width=96, height=96)
-        except tk.TclError:
-            self.thumb = None
-            self.thumb_label.configure(image="", text="JPG", width=12, height=5)
+    def _update_summary(self):
+        with self.lock:
+            c = copy.deepcopy(self.content)
+        blocks = c["blocks"]
+        files = pe.used_files(blocks)
+        size = sum(os.path.getsize(asset_path(n)) for n in files if os.path.exists(asset_path(n)))
+        parts = [f"{len(blocks)} block{'s' if len(blocks) != 1 else ''}",
+                 f"{len(files)} image{'s' if len(files) != 1 else ''}" + (f" ({size / 1024:.0f} kB)" if files else "")]
+        if c.get("survey_on"):
+            parts.append("survey on")
+        heading = next((b["text"] for b in blocks if b["type"] == "heading" and b["text"].strip()), "")
+        self.page_summary.configure(text=(f"“{heading}”   ·   " if heading else "") + "   ·   ".join(parts),
+                                    wraplength=420, justify="left")
+        for w in self.page_colors.winfo_children():
+            w.destroy()
+        for key, label in (("bg", "Background"), ("card", "Card"), ("fg", "Text"), ("accent", "Accent")):
+            border = tk.Frame(self.page_colors, bg="#6A6A6A", padx=1, pady=1)
+            border.pack(side="left")
+            tk.Frame(border, bg=c[key], width=16, height=16).pack()
+            self._label(self.page_colors, label, size=9, color=MUTED, bg=SURFACE2).pack(side="left", padx=(5, 12))
 
-    def pick_image(self):
-        path = filedialog.askopenfilename(
-            title="Choose an image",
-            filetypes=[("Images", "*.png *.jpg *.jpeg"), ("PNG", "*.png"), ("JPG", "*.jpg *.jpeg")])
-        if not path:
-            return
-        ext = os.path.splitext(path)[1].lower()
-        if ext not in IMAGE_TYPES:
-            messagebox.showwarning("Portal Admin", "Choose a PNG or JPG file.")
-            return
-        size = os.path.getsize(path)
-        if size > MAX_IMAGE_BYTES:
-            messagebox.showwarning(
-                "Portal Admin",
-                f"This image is {size / 1024:.0f} kB. The maximum is {MAX_IMAGE_BYTES // 1024} kB.\n\n"
-                "Resize the image (e.g. to 800 px wide) and try again.")
-            return
-        os.makedirs(ASSETS_DIR, exist_ok=True)
-        name = "image" + (".jpg" if ext == ".jpeg" else ext)
-        for old in os.listdir(ASSETS_DIR):
-            os.remove(os.path.join(ASSETS_DIR, old))
-        shutil.copyfile(path, os.path.join(ASSETS_DIR, name))
-        self.content["image"] = name
-        self._update_thumb()
-        self._collect()
+    # --- editor web server (these callbacks run on the server's threads)
+    def _editor_content(self):
+        with self.lock:
+            return copy.deepcopy(self.content), self.rev
 
-    def remove_image(self):
-        self.content["image"] = ""
-        self._update_thumb()
-        self._collect()
+    def _editor_update(self, edit):
+        with self.lock:
+            self.content.update(pe.normalize_edit(edit, self.content))
+            self.rev += 1
+            save_store(self.store)
+            rev = self.rev
+        self.calls.put(self._update_summary)
+        return rev
 
-    def pick_color(self, key):
-        _, hex_color = colorchooser.askcolor(color=self.content[key], title="Choose a colour")
-        if hex_color:
-            self.content[key] = hex_color.upper()
-            self.color_buttons[key].configure(bg=hex_color, activebackground=hex_color)
+    def _editor_render(self):
+        with self.lock:
+            return render_html(copy.deepcopy(self.content))
+
+    def _editor_status(self):
+        with self.lock:
+            rev = self.rev
+        return {"status": getattr(self, "status_text", ""), "kind": self.status_kind,
+                "busy": self.busy, "rev": rev}
+
+    def open_editor(self):
+        if self.editor is None:
             self._collect()
+            try:
+                self.editor = pe.EditorServer(ASSETS_DIR, self._editor_content, self._editor_update,
+                                              self._editor_render, self._editor_status,
+                                              lambda: self.calls.put(self.upload_portal))
+            except OSError as exc:
+                messagebox.showerror("Portal Admin", f"Cannot start the editor: {exc}")
+                return
+        self.editor.open_window()
 
     def reset_editor(self):
         if not messagebox.askyesno("Restore defaults",
-                                   "Reset all text, colours and the image in the editor?"):
+                                   f"Reset the portal “{self.content['name']}” (all blocks, images, "
+                                   "colours and its survey) to the default content?"):
             return
-        self.content = dict(DEFAULT_CONTENT)
+        with self.lock:
+            fresh = copy.deepcopy(DEFAULT_CONTENT)
+            for key in PORTAL_KEYS:
+                fresh[key] = self.content[key]
+            idx = self.store["portals"].index(self.content)
+            self.store["portals"][idx] = fresh
+            self.content = fresh
+            self.rev += 1
         self._load_editor()
         self._collect()
 
     def preview(self):
         c = self._collect()
         folder = os.path.join(tempfile.gettempdir(), "esp32-portal-preview")
+        shutil.rmtree(folder, ignore_errors=True)
         os.makedirs(folder, exist_ok=True)
-        url = ""
-        src = image_path(c)
-        if src:
-            shutil.copyfile(src, os.path.join(folder, c["image"]))
-            url = c["image"]
+        for name in pe.used_files(c["blocks"]):
+            if os.path.exists(asset_path(name)):
+                shutil.copyfile(asset_path(name), os.path.join(folder, name))
         out = os.path.join(folder, "index.html")
         with open(out, "w", encoding="utf-8") as f:
-            f.write(render_html(c, url))
+            f.write(render_html(c))
         with open(os.path.join(folder, "thanks.html"), "w", encoding="utf-8") as f:
             f.write(render_thanks(c))
         webbrowser.open("file:///" + out.replace("\\", "/"))
 
-    def upload_portal(self):
+    def upload_portal(self, then=None):
+        """Upload all portals; then() runs after a successful upload (used by restore)."""
+        if self.busy:
+            return
         port = self.port()
         if not port:
             self.set_status("Select a port first.", SECONDARY)
             return
-        c = self._collect()
-        if c["survey_on"]:
-            if not c["survey_question"]:
-                messagebox.showwarning("Portal Admin", "Enter a survey question (Survey tab).")
+        self._collect()
+        with self.lock:
+            store = copy.deepcopy(self.store)
+        for c in store["portals"]:
+            if c["survey_on"] and not c["survey_question"]:
+                messagebox.showwarning("Portal Admin", f"Enter a survey question for “{c['name']}” "
+                                                       "(Survey tab), or turn its survey off.")
                 return
-            if len(survey_options(c)) < 2:
-                messagebox.showwarning("Portal Admin", "Enter at least 2 answers (Survey tab).")
+            if c["survey_on"] and c["survey_type"] != "open" and len(survey_options(c)) < 2:
+                messagebox.showwarning("Portal Admin", f"Enter at least 2 answers for “{c['name']}” "
+                                                       "(Survey tab).")
                 return
-        src = image_path(c)
-        image_data = b""
-        target = ""
-        if src:
-            with open(src, "rb") as f:
-                image_data = f.read()
-            target = IMAGE_TYPES[os.path.splitext(src)[1].lower()]
-        page = render_html(c, f"{target[1:]}?v={int(time.time())}" if target else "").encode("utf-8")
-        thanks = render_thanks(c).encode("utf-8")
-        cfg = survey_cfg(c).encode("utf-8") if c["survey_on"] else b""
-        total = len(image_data) + len(page) + len(thanks) + len(cfg)
+        try:
+            images = []
+            for name in all_images(store):
+                if not os.path.exists(asset_path(name)):
+                    raise FileNotFoundError(f"Image {name} is missing from {ASSETS_DIR}. "
+                                            "Choose it again in the editor.")
+                with open(asset_path(name), "rb") as f:
+                    images.append((name, f.read()))
+        except FileNotFoundError as exc:
+            messagebox.showwarning("Portal Admin", str(exc))
+            return
+        used = [n for n, _ in images]
+        files = []                                  # (name, bytes) per portal
+        for c in store["portals"]:
+            pre = f"p-{c['id']}-"
+            files.append((pre + "index.html", render_html(c).encode("utf-8")))
+            files.append((pre + "thanks.html", render_thanks(c).encode("utf-8")))
+            if c["survey_on"]:
+                files.append((pre + "survey.cfg", survey_cfg(c).encode("utf-8")))
+        cfg = portals_cfg(store).encode("utf-8")
+        settings = json.dumps(store_data(store), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+        keep = {n for n, _ in files} | set(used) | {"portals.cfg", "portal.json"}
+        total = sum(len(d) for _, d in images + files) + len(cfg) + len(settings)
 
         def work(report):
+            sent = 0
             with Board(port) as b:
-                # also clean up image names used by older versions of this app
-                for name in set(IMAGE_TYPES.values()) | {"/afbeelding.png", "/afbeelding.jpg"}:
-                    if name != target:
-                        b.ok(f"FDEL {name}")
-                if image_data:
-                    b.put_file(target, image_data, report)
-                done_bytes = len(image_data)
-                b.put_file("/index.html", page, lambda n: report(done_bytes + n))
-                done_bytes += len(page)
-                b.put_file("/thanks.html", thanks, lambda n: report(done_bytes + n))
-                if cfg:
-                    b.put_file("/survey.cfg", cfg)
-                else:
-                    b.ok("FDEL /survey.cfg")
-                return b.cmd("FS")
 
-        def done(fs):
-            used = total_kb = ""
+                def put(name, data):
+                    nonlocal sent
+                    start = sent
+                    b.put_file("/" + name, data, lambda n: report(start + n))
+                    sent = start + len(data)
+
+                if "portal" not in parse_info(b.cmd("INFO")):
+                    raise RuntimeError("The ESP32 needs firmware 2.4 or newer for portals. "
+                                       "Flash the firmware first (see README).")
+                remote = b.list_files() or {}
+                for name in sorted(remote):          # free space: images no longer used
+                    if pe.is_image_name(name) and name not in keep:
+                        b.ok(f"FDEL /{name}")
+                for name, data in images:
+                    if remote.get(name) == len(data):
+                        sent += len(data)            # same content-hash name and size: already there
+                        report(sent)
+                        continue
+                    put(name, data)
+                for name, data in files:
+                    put(name, data)
+                put("portals.cfg", cfg)              # switches the board to the new portal files
+                # files of deleted portals, surveys that were turned off, and the old single-portal files
+                for name in sorted(remote):
+                    old_portal_file = PORTAL_FILE_RE.match(name) and name not in keep
+                    if old_portal_file or name in ("index.html", "thanks.html", "survey.cfg"):
+                        b.ok(f"FDEL /{name}")
+                put("portal.json", settings)
+                return b.cmd("FS"), parse_info(b.cmd("INFO"))
+
+        def done(result):
+            fs, info = result
+            with self.lock:
+                self.store["board_files"] = used
+                self.store["synced_hash"] = store_hash(store)
+                save_store(self.store)
+            self._show_info(info)
+            used_kb = total_kb = "?"
             if fs.startswith("FS"):
                 vals = dict(p.split("=") for p in fs.split()[1:])
-                used = int(vals.get("used", 0)) // 1024
+                used_kb = int(vals.get("used", 0)) // 1024
                 total_kb = int(vals.get("total", 0)) // 1024
-            self.set_status(f"Portal uploaded ({total / 1024:.0f} kB). Storage: {used} of {total_kb} kB in use.",
-                            SUCCESS)
+            n = len(store["portals"])
+            self.set_status(f"Uploaded {n} portal{'s' if n != 1 else ''} ({total / 1024:.0f} kB, "
+                            f"{len(used)} image(s)). Storage: {used_kb} of {total_kb} kB in use.", SUCCESS)
+            if then:
+                then()
 
-        self.run_bg(work, done, "Uploading portal…", progress_total=total)
+        self.run_bg(work, done, "Uploading portals…", progress_total=total)
+
+    # ------------------------------------------------------------ Backup
+    def create_backup(self):
+        self._collect()
+        port = self.port()
+        if not port and not messagebox.askyesno(
+                "Create backup", "No ESP32 is connected. The backup then only contains the portals on this "
+                                 "PC, without the WiFi settings and survey answers.\n\nContinue?"):
+            return
+        missing = [n for n in all_images(self.store) if not os.path.exists(asset_path(n))]
+        if missing and not messagebox.askyesno(
+                "Create backup", f"{len(missing)} image(s) are missing on this PC and will not be in the "
+                                 "backup. Continue?"):
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save backup", defaultextension=".zip", filetypes=[("Portal backup", "*.zip")],
+            initialfile=f"portal-backup-{time.strftime('%Y-%m-%d')}.zip")
+        if not path:
+            return
+        with self.lock:
+            store = copy.deepcopy(self.store)
+
+        def work(_r):
+            board, log = None, b""
+            if port:
+                with Board(port) as b:
+                    info = parse_info(b.cmd("INFO"))
+                    wifi = b.wifi()
+                    log = b.get_file(SURVEY_LOG)
+                board = {"fw": info.get("fw"), "wifi": wifi,
+                         "active_portal": info.get("portal") if info.get("portal") not in (None, "-") else None}
+            write_backup(path, store, board, log)
+            return board, log
+
+        def done(result):
+            board, log = result
+            answers = max(0, len(log.splitlines()) - 1) if log else 0
+            extra = ""
+            if board and not board["wifi"]:
+                extra = " WiFi settings not included: flash firmware 2.5 or newer for that."
+            self.set_status(f"Backup saved: {os.path.basename(path)} ({len(store['portals'])} portal(s), "
+                            f"{answers} answer(s)).{extra}", SUCCESS if not extra else SECONDARY)
+
+        self.run_bg(work, done, "Creating backup…")
+
+    def restore_backup(self):
+        path = filedialog.askopenfilename(title="Restore backup", filetypes=[("Portal backup", "*.zip")])
+        if not path:
+            return
+        try:
+            meta, store, images, log = read_backup(path)
+        except (OSError, ValueError) as exc:
+            messagebox.showerror("Restore backup", str(exc))
+            return
+        board = meta.get("board") or {}
+        wifi = board.get("wifi")
+        port = self.port()
+        answers = max(0, len(log.splitlines()) - 1) if log else 0
+        lines = [f"Backup from {meta.get('created', '?')}:",
+                 f"  \u2022  {len(store['portals'])} portal(s): " + ", ".join(q["name"] for q in store["portals"]),
+                 f"  \u2022  {len(images)} image(s), {answers} survey answer(s)"]
+        if wifi:
+            lines.append(f"  \u2022  WiFi: \u201c{wifi['ssid']}\u201d, "
+                         + ("open network" if not wifi["pass"] else "with password"))
+        lines.append("")
+        lines.append("This replaces the portals on this PC (the current ones are saved as a backup file).")
+        if port:
+            lines.append(f"Everything is then put on the ESP32 on {port}"
+                         + (" and it restarts with the WiFi settings from the backup." if wifi else "."))
+        else:
+            lines.append("No ESP32 is connected: only this PC is restored. Connect the ESP32 and restore "
+                         "again to put everything on it.")
+        if not messagebox.askyesno("Restore backup", "\n".join(lines) + "\n\nRestore now?"):
+            return
+
+        # 1. this PC
+        if os.path.exists(CONTENT_FILE):
+            shutil.copyfile(CONTENT_FILE, os.path.join(HERE, "portal_content.backup.json"))
+        os.makedirs(ASSETS_DIR, exist_ok=True)
+        for name, data in images.items():
+            with open(asset_path(name), "wb") as f:
+                f.write(data)
+        with self.lock:
+            store.pop("synced_hash", None)
+            self.store = store
+            self.content = self._current_portal()
+            self.rev += 1
+            save_store(store)
+        self.had_local_file = True
+        self._load_editor()
+        if not port:
+            self.set_status("Backup restored on this PC. Connect the ESP32 and restore again to put it on "
+                            "the board.", SUCCESS)
+            return
+
+        # 2. the ESP32: portals first, then answers, active portal and WiFi
+        def board_work(_r):
+            with Board(port) as b:
+                current = b.get_file(SURVEY_LOG)
+                merged = merge_logs(log, current) if log else current
+                if merged and merged != current:
+                    b.put_file(SURVEY_LOG, merged)
+                active = board.get("active_portal")
+                ids = [q["id"] for q in store["portals"]]
+                b.ok(f"PORTAL {active if active in ids else ids[0]}", timeout=8)   # also recounts the votes
+                restart = False
+                if wifi:
+                    now = b.wifi()
+                    if now is not None and not wifi["ap"] and now["ap"]:
+                        b.ok("AP 0", timeout=5)
+                    if now is not None and wifi["ap"] and not now["ap"]:
+                        b.ok("AP 1", timeout=8)
+                    if now is None or (now["ssid"], now["pass"]) != (wifi["ssid"], wifi["pass"]):
+                        pass_arg = to_hex(wifi["pass"]) if wifi["pass"] else "-"
+                        reply = b.cmd(f"SET {to_hex(wifi['ssid'])} {pass_arg}")
+                        if reply.startswith("ERR"):
+                            raise RuntimeError("WiFi settings not restored: " + reply[4:])
+                        restart = True
+            info = self._wait_for_restart(port) if restart else parse_info(send_command(port, "INFO"))
+            return info, merged
+
+        def board_done(result):
+            info, merged = result
+            self._show_info(info)
+            n = max(0, len(merged.splitlines()) - 1) if merged else 0
+            self.set_status(f"Backup restored on this PC and the ESP32 ({len(store['portals'])} portal(s), "
+                            f"{n} answer(s) on the board).", SUCCESS)
+
+        self.upload_portal(then=lambda: self.run_bg(board_work, board_done, "Restoring answers and WiFi…"))
 
     # ------------------------------------------------------------ Results
     def load_results(self):
@@ -1056,44 +1747,58 @@ class App(tk.Tk):
             return
 
         def work(_r):
-            data = b""
             with Board(port) as b:
-                while True:
-                    reply = b.cmd(f"FREAD {SURVEY_LOG} {len(data)}")
-                    if reply.startswith("EOF"):
-                        break
-                    if not reply.startswith("DATA"):
-                        raise RuntimeError(reply[4:] if reply.startswith("ERR") else reply)
-                    chunk = base64.b64decode(reply[5:].strip())
-                    if not chunk:
-                        break
-                    data += chunk
-            return data
+                return b.get_file(SURVEY_LOG)
 
         def done(data):
             self.log_raw = data
-            rows = list(csv.DictReader(io.StringIO(data.decode("utf-8", errors="replace"))))
-            self.log_rows = rows
-            self.tree.delete(*self.tree.get_children())
-            for r in reversed(rows):
-                self.tree.insert("", "end", values=(r.get("time", ""), r.get("device", ""),
-                                                    r.get("question", ""), r.get("answer", "")))
-            self._summarise(rows)
-            self.set_status(f"Loaded {len(rows)} answer(s) from the ESP32.", SUCCESS)
+            self.log_rows = list(csv.DictReader(io.StringIO(data.decode("utf-8", errors="replace"))))
+            self._show_results()
+            self.set_status(f"Loaded {len(self.log_rows)} answer(s) from the ESP32.", SUCCESS)
 
         self.run_bg(work, done, "Reading results…")
 
-    def _summarise(self, rows):
+    def _portal_of(self, row):
+        """Portal name for a log row (survey ids start with the portal id)."""
+        pid = (row.get("survey_id") or "").split("-")[0]
+        return next((q["name"] for q in self.store["portals"] if q["id"] == pid),
+                    "(deleted portal)" if "-" in (row.get("survey_id") or "") else "(before portals)")
+
+    def _show_results(self):
+        names = ["All portals"] + [q["name"] for q in self.store["portals"]]
+        self.filter_box["values"] = names
+        if self.results_filter.get() not in names:
+            self.results_filter.set("All portals")
+        chosen = self.results_filter.get()
+        rows = [r for r in self.log_rows if chosen == "All portals" or self._portal_of(r) == chosen]
+        self.tree.delete(*self.tree.get_children())
+        for r in reversed(rows):
+            self.tree.insert("", "end", values=(r.get("time", ""), self._portal_of(r), r.get("device", ""),
+                                                r.get("question", ""), r.get("answer", "")))
+        portal = next((q for q in self.store["portals"] if q["name"] == chosen), self.content)
+        self._summarise(rows, portal)
+
+    def _show_answer(self, _event=None):
+        item = self.tree.focus()
+        if item:
+            t, portal, device, question, answer = self.tree.item(item, "values")
+            messagebox.showinfo("Answer", f"{answer}\n\n{t}  ·  {portal}  ·  {device}\n{question}")
+
+    def _summarise(self, rows, portal=None):
         if not rows:
             self.results_summary.configure(text="No answers yet.")
             self.results_detail.configure(text="")
             return
-        sid = survey_id(self.content)
+        portal = portal or self.content
+        sid = survey_id(portal)
         current = [r for r in rows if r.get("survey_id") == sid] or \
                   [r for r in rows if r.get("survey_id") == rows[-1].get("survey_id")]
         question = current[-1].get("question", "")
         answers = [r.get("answer", "") for r in current]
-        if all(a in "12345" and a for a in answers) and self.content.get("survey_type") == "stars":
+        if current[-1].get("answer_index") == "0":       # open question
+            summary = f"{len(answers)} answer{'s' if len(answers) != 1 else ''}"
+            dist = "Double-click a row to read the full answer."
+        elif all(a in "12345" and a for a in answers) and portal.get("survey_type") == "stars":
             avg = sum(int(a) for a in answers) / len(answers)
             dist = "  ".join(f"{i}\u2605 {answers.count(str(i))}" for i in range(5, 0, -1))
             summary = f"\u2605 {avg:.1f} / 5   ({len(answers)} votes)"
@@ -1105,8 +1810,9 @@ class App(tk.Tk):
             summary = f"{len(answers)} votes"
         self.results_summary.configure(text=summary)
         older = len(rows) - len(current)
-        extra = f"   ·   {older} answer(s) from earlier surveys" if older else ""
-        self.results_detail.configure(text=f"\u201c{question}\u201d   {dist}{extra}", wraplength=440,
+        extra = f"   ·   {older} other answer(s) in this view" if older else ""
+        self.results_detail.configure(text=f"{self._portal_of(current[-1])}:  \u201c{question}\u201d   "
+                                           f"{dist}{extra}", wraplength=440,
                                       justify="left")
 
     def export_results(self):
@@ -1118,8 +1824,12 @@ class App(tk.Tk):
                                             filetypes=[("CSV (Excel)", "*.csv")])
         if not path:
             return
+        fields = ["portal"] + list(self.log_rows[0].keys()) if self.log_rows else ["portal"]
         with open(path, "w", encoding="utf-8-sig", newline="") as f:   # BOM: Excel opens UTF-8 correctly
-            f.write(self.log_raw.decode("utf-8", errors="replace"))
+            w = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+            w.writeheader()
+            for r in self.log_rows:
+                w.writerow(dict(r, portal=self._portal_of(r)))
         self.set_status(f"Exported to {path}", SUCCESS)
 
     def clear_results(self):
@@ -1136,8 +1846,7 @@ class App(tk.Tk):
 
         def done(_):
             self.log_rows, self.log_raw = [], b""
-            self.tree.delete(*self.tree.get_children())
-            self._summarise([])
+            self._show_results()
             self.set_status("Survey log cleared.", SUCCESS)
 
         self.run_bg(work, done, "Clearing log…")

@@ -12,8 +12,16 @@ USB-C with the **Portal Admin** app: network name, landing page (text, image, co
 - Captive portal: every web request is redirected to your landing page; no internet needed
 - Live status on the AMOLED display: online/offline, network name, connected devices, votes, survey result
 - Tap the network card on the display to turn the WiFi network on or off
-- Landing page editor with image upload (PNG/JPG) and colour picker
-- Mini-survey: star rating (1–5), yes/no or multiple choice, one answer per device
+- TX button on the network card: WiFi transmit power 25% / 50% / 75% / 100% (default 50%,
+  enough for a classroom; use 75–100% for a large hall)
+- Battery saving: CPU at 80 MHz; on battery the display dims after 10 s and switches off after
+  another 30 s (a touch or the PWR button wakes it)
+- Several portals (up to 8), e.g. "Open day" and "Parents' evening", each with its own page, survey
+  and optional network name; choose the active one with the PORTAL button on the display
+- Page editor with live preview: headings, formatted text, images, photo galleries, highlights,
+  dividers and spacing; colour themes, fonts and layout. Large photos are resized automatically
+- Mini-survey: star rating (1–5), yes/no, multiple choice or an open question (up to 240 characters),
+  one answer per device
 - Results table in the app with CSV export (opens in Excel)
 - Both hardware revisions supported and detected automatically (SH8601 + FT3168, or CO5300 + CST820)
 
@@ -70,9 +78,69 @@ Start it with **`Portal Admin.exe`** (see *Releases*), or from source with `admi
 | Tab | What you can do |
 |---|---|
 | **WiFi** | Turn the network on/off, change network name and password, factory reset |
-| **Portal** | Heading, text, footer, image, colours; preview in your browser; upload to the board |
-| **Survey** | Show a question on the portal: star rating, yes/no or multiple choice; thank-you page |
+| **Portal** | Open the page editor; preview in your browser; upload to the board |
+| **Survey** | Show a question on the portal: star rating, yes/no, multiple choice or open question; thank-you page |
 | **Results** | Read the answers from the board, summary, export to CSV, clear the log |
+| **Backup** | Save everything (portals, images, WiFi settings, active portal, answers) to one file and restore it |
+
+### Portals
+
+At the top of the app you choose the portal you are editing, and add (**New**, **Duplicate**) or
+remove portals. Each portal has its own page, survey and thank-you page. In the Portal tab you set
+its name (shown on the display) and, optionally, its own network name; leave that empty to use the
+name from the WiFi tab.
+
+**Upload all portals to ESP32** puts every portal on the board (images used by several portals are
+stored once). Choose the active portal on the display: tap the **PORTAL** button at the bottom right
+and tap a portal in the list (the list closes after 15 seconds). Or click **Make active on ESP32** in
+the app. When a portal has its own network name the WiFi network restarts with that name, so
+connected phones have to reconnect.
+
+In the Results tab you can show the answers of one portal or all; the CSV export has a `portal`
+column. Needs firmware 2.4 or newer.
+
+### Backup
+
+**Create backup** saves one `.zip` file with all portals and images, the WiFi settings (name,
+password, network on/off), the active portal and all survey answers. Use it before you install
+another program on the ESP32: that usually erases the board's storage.
+
+To get everything back: flash this firmware again (section 3), start Portal Admin and click
+**Restore backup**. The portals go back on this PC and on the board, the board restarts with the
+WiFi settings from the backup, and the answers from the backup are added to any answers already on
+the board. Devices that answered before can answer once more after a reinstall (the board's secret
+for recognising devices is new).
+
+The backup contains the WiFi password and survey answers: keep it in a safe place. WiFi settings
+need firmware 2.5 or newer.
+
+### Page editor
+
+**Open page editor** (Portal tab) opens the editor in its own window. Build the page from blocks:
+
+| Block | |
+|---|---|
+| Heading | large, medium or small; left or centred |
+| Text | bold, italic, underline, lists, links |
+| Image | caption, description for screen readers, full/75%/half width |
+| Gallery | up to 12 photos in 2 or 3 columns |
+| Highlight | coloured box for important information |
+| Divider / Space | structure the page |
+
+Drag blocks by their handle (⋮⋮) or use the arrows to reorder them. The **Style** tab has
+colour themes, colours, font, layout (card or full page) and width. The preview on the right
+updates while you type (phone or desktop view). Changes are saved automatically; click
+**Upload to ESP32** in the editor or the app to put the page on the board.
+
+Photos are resized to at most 1280 px before they are stored, so you can use photos straight
+from a phone. The board has about 3 MB of space for pages and images; the editor shows how much
+your images use. With firmware 2.2 or newer, uploads skip images that are already on the board.
+
+When the app starts it downloads the page, survey settings and images from the board (stored there
+on every upload, firmware 2.3 or newer). On a new PC you only need the exe and the board. If this PC has
+changes that were not uploaded yet, the app asks which version to keep and saves a backup of the other.
+
+Survey answers, voter keys and the app settings on the board can only be read over USB, not over WiFi.
 
 Your editor content is stored locally in `admin/portal_content.json` and `admin/portal_assets/`
 (both ignored by git).

@@ -21,6 +21,10 @@ static void loadSalt() {
   saltLoaded = true;
 }
 
+static String cfgPath = SURVEY_CFG;   // survey of the active portal
+
+void surveySetConfig(const String &path) { cfgPath = path; }
+
 static bool active = false;
 static String sId, sType, sQuestion;
 static String labels[SURVEY_MAX_OPTIONS];
@@ -50,7 +54,9 @@ static void countFromLog() {
     String line = f.readStringUntil('\n');
     if (!line.startsWith(prefix)) continue;
     int idx = line.substring(prefix.length()).toInt();
-    if (idx >= 1 && idx <= nOptions) {
+    if (sType == "open") {
+      votes++;
+    } else if (idx >= 1 && idx <= nOptions) {
       counts[idx - 1]++;
       votes++;
     }
@@ -93,8 +99,8 @@ bool surveyHasVoted(const String &voterKey) {
 void surveyReload() {
   active = false;
   nOptions = 0;
-  if (LittleFS.exists(SURVEY_CFG)) {
-    File f = LittleFS.open(SURVEY_CFG, "r");
+  if (LittleFS.exists(cfgPath)) {
+    File f = LittleFS.open(cfgPath, "r");
     sId = f.readStringUntil('\n');
     sType = f.readStringUntil('\n');
     sQuestion = f.readStringUntil('\n');
@@ -111,7 +117,8 @@ void surveyReload() {
       if (tab < 0) break;
       start = tab + 1;
     }
-    active = sId.length() && nOptions >= 2 && (sType == "stars" || sType == "yesno" || sType == "choice");
+    active = sId.length() && ((nOptions >= 2 && (sType == "stars" || sType == "yesno" || sType == "choice")) ||
+                              sType == "open");
   }
   countFromLog();
   // Keys include the survey id, so a new survey starts with an empty list
@@ -147,6 +154,7 @@ float surveyAverage() {
 String surveySummary() {
   if (!active) return "No survey active";
   if (!votes) return "No votes yet";
+  if (sType == "open") return String(votes) + (votes == 1 ? " answer" : " answers");
   if (sType == "stars") {
     char buf[24];
     snprintf(buf, sizeof(buf), "%.1f / 5", surveyAverage());
@@ -160,9 +168,9 @@ String surveySummary() {
   return out;
 }
 
-String surveyRecord(int index, const String &time, const String &device, const String &voterKey) {
-  if (!active) return "No survey active";
-  if (index < 1 || index > nOptions) return "Invalid answer";
+// Shared by both record functions: checks, then appends one line to the log.
+static String appendAnswer(int index, const String &answer, const String &time, const String &device,
+                           const String &voterKey) {
   if (surveyHasVoted(voterKey)) return "Already answered";
 
   bool exists = LittleFS.exists(SURVEY_LOG);
@@ -186,7 +194,7 @@ String surveyRecord(int index, const String &time, const String &device, const S
   if (!f) return "Cannot write log";
   if (!exists) f.print("survey_id,answer_index,time,device,question,answer\n");
   f.print(sId + "," + String(index) + "," + csvField(t) + "," + csvField(device) + "," +
-          csvField(sQuestion) + "," + csvField(labels[index - 1]) + "\n");
+          csvField(sQuestion) + "," + csvField(answer) + "\n");
   f.close();
 
   if (voterKey.length()) {
@@ -198,10 +206,37 @@ String surveyRecord(int index, const String &time, const String &device, const S
     voters.insert(voterKey);
   }
 
-  counts[index - 1]++;
+  if (index >= 1) counts[index - 1]++;
   votes++;
-  Serial.printf("[SURVEY] answer %d (%s) from %s\n", index, labels[index - 1].c_str(), device.c_str());
+  Serial.printf("[SURVEY] answer %d from %s\n", index, device.c_str());
   return "";
+}
+
+String surveyRecord(int index, const String &time, const String &device, const String &voterKey) {
+  if (!active || sType == "open") return "No survey active";
+  if (index < 1 || index > nOptions) return "Invalid answer";
+  return appendAnswer(index, labels[index - 1], time, device, voterKey);
+}
+
+String surveyRecordText(const String &text, const String &time, const String &device, const String &voterKey) {
+  if (!active || sType != "open") return "No survey active";
+  // Keep printable text only (control characters become spaces), max SURVEY_MAX_TEXT
+  // UTF-8 characters; never cut a multi-byte character in half.
+  String clean;
+  int chars = 0;
+  for (size_t i = 0; i < text.length(); i++) {
+    uint8_t b = (uint8_t)text[i];
+    bool lead = (b & 0xC0) != 0x80;
+    if (lead && chars == SURVEY_MAX_TEXT) break;
+    if (lead) chars++;
+    clean += (b < 0x20 || b == 0x7F) ? ' ' : (char)b;
+  }
+  clean.trim();
+  if (clean.isEmpty()) return "Empty answer";
+  // Excel would run text starting with = + - @ as a formula: store it as plain text
+  char first = clean[0];
+  if (first == '=' || first == '+' || first == '-' || first == '@') clean = "'" + clean;
+  return appendAnswer(0, clean, time, device, voterKey);
 }
 
 // ------------------------------------------------------------------ device type
