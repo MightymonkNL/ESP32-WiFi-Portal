@@ -3,11 +3,12 @@ rem Builds the firmware of all modules (admin\modules\*\firmware) and
 rem "ESP32 Toolbox.exe" in this folder. Run again after changing a project or the app.
 rem Requires Python 3 and PlatformIO.
 cd /d "%~dp0"
-python -m pip install --user --quiet pyinstaller pyserial || goto :error
+python -m pip install --user --quiet pyinstaller pyserial pillow || goto :error
 python admin\build_modules.py || goto :error
 python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --name "ESP32 Toolbox" ^
   --paths admin ^
+  --exclude-module numpy --exclude-module PIL.ImageQt --exclude-module PIL.ImageTk ^
   --distpath "%~dp0." ^
   --workpath "%TEMP%\esp32-toolbox-build" ^
   --specpath "%TEMP%\esp32-toolbox-build" ^

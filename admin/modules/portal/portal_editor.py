@@ -8,6 +8,7 @@ the Tk app owns the content and uploads it to the board.
 
 import hashlib
 import html
+import io
 import json
 import os
 import re
@@ -33,7 +34,13 @@ FONTS = {
 WIDTHS = {"narrow": 460, "normal": 560, "wide": 760}
 TONES = {"orange": "#FF612B", "green": "#38A84A"}   # "accent" uses the page accent colour
 
-MAX_IMAGE_BYTES = 2 * 1024 * 1024
+MAX_IMAGE_BYTES = 2 * 1024 * 1024        # largest image stored for the board
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024      # largest file accepted from the editor (GIFs are shrunk)
+# Animated GIFs are stored as they are when small; larger ones are scaled down (all frames kept)
+GIF_KEEP_BYTES = 600 * 1024              # smaller and not wider than GIF_KEEP_SIDE: unchanged
+GIF_KEEP_SIDE = 640
+GIF_SIDES = (480, 400, 320, 240, 180)    # tried in this order until the GIF fits GIF_TARGET_BYTES
+GIF_TARGET_BYTES = 700 * 1024
 MAX_GALLERY = 12
 FILE_RE = re.compile(r"^[A-Za-z0-9_-]{1,24}\.(png|jpg|gif|webp)$")
 HEX_RE = re.compile(r"^#[0-9A-Fa-f]{6}$")
@@ -61,11 +68,76 @@ def image_ext(data):
     return None
 
 
+def gif_info(data):
+    """(width, height, frames) of a GIF, from its header and frame markers (no Pillow needed)."""
+    w = int.from_bytes(data[6:8], "little")
+    h = int.from_bytes(data[8:10], "little")
+    frames = max(1, data.count(b"\x00\x2c"))        # end of a block + image descriptor (estimate)
+    return w, h, frames
+
+
+def _gif_frames(im, side):
+    from PIL import Image, ImageSequence
+    w, h = im.size
+    scale = min(1.0, side / max(w, h))
+    size = (max(1, round(w * scale)), max(1, round(h * scale)))
+    frames, durations = [], []
+    for frame in ImageSequence.Iterator(im):
+        durations.append(frame.info.get("duration", im.info.get("duration", 100)) or 100)
+        frames.append(frame.convert("RGBA").resize(size, Image.LANCZOS))
+    return frames, durations
+
+
+def shrink_gif(data):
+    """Scales an animated GIF down until it fits on the board; keeps all frames and timing.
+    Returns (bytes, note) — note is a message for the editor, or ""."""
+    w, h, _ = gif_info(data)
+    if len(data) <= GIF_KEEP_BYTES and max(w, h) <= GIF_KEEP_SIDE:
+        return data, ""
+    try:
+        from PIL import Image
+    except ImportError:
+        if len(data) <= MAX_IMAGE_BYTES:
+            return data, ""
+        raise ValueError(f"This GIF is {len(data) // 1024} kB; the maximum is {MAX_IMAGE_BYTES // 1024} kB.")
+    try:
+        im = Image.open(io.BytesIO(data))
+        loop = im.info.get("loop", 0)
+        best = None
+        for side in GIF_SIDES:
+            if side >= max(w, h) and best is not None:
+                continue
+            frames, durations = _gif_frames(im, side)
+            buf = io.BytesIO()
+            frames[0].save(buf, "GIF", save_all=True, append_images=frames[1:], duration=durations,
+                           loop=loop, disposal=2, optimize=True)
+            out = buf.getvalue()
+            best = (out, frames[0].size, len(frames))
+            if len(out) <= GIF_TARGET_BYTES:
+                break
+    except Exception as exc:  # noqa: BLE001  (damaged or unusual GIF)
+        if len(data) <= MAX_IMAGE_BYTES:
+            return data, ""
+        raise ValueError(f"This GIF could not be made smaller ({exc}).") from exc
+    out, size, n = best
+    if len(out) >= len(data):
+        if len(data) <= MAX_IMAGE_BYTES:
+            return data, ""
+    if len(out) > MAX_IMAGE_BYTES:
+        raise ValueError(f"This GIF is still {len(out) // 1024} kB at {size[0]}×{size[1]} px "
+                         f"({n} frames). Use a shorter GIF.")
+    return out, (f"Animated GIF resized from {w}×{h} to {size[0]}×{size[1]} px "
+                 f"({len(data) // 1024} → {len(out) // 1024} kB, {n} frames).")
+
+
 def store_image(assets_dir, data):
-    """Save image bytes under a content-hash name; returns the name."""
+    """Save image bytes under a content-hash name; returns (name, stored bytes, note)."""
     ext = image_ext(data)
     if not ext:
         raise ValueError("Unsupported image (use PNG, JPG, GIF or WebP).")
+    note = ""
+    if ext == "gif":
+        data, note = shrink_gif(data)
     if len(data) > MAX_IMAGE_BYTES:
         raise ValueError(f"Image is larger than {MAX_IMAGE_BYTES // 1024} kB.")
     name = f"img-{hashlib.sha1(data).hexdigest()[:10]}.{ext}"
@@ -74,7 +146,7 @@ def store_image(assets_dir, data):
     if not os.path.exists(path):
         with open(path, "wb") as f:
             f.write(data)
-    return name
+    return name, data, note
 
 
 def used_files(blocks):
@@ -426,9 +498,11 @@ class _Handler(BaseHTTPRequestHandler):
                 content, _ = self.ed.get_content()
                 return self._send(200, {"rev": rev, "sizes": self.ed.sizes(content)})
             if path == "/api/image":
-                data = self._body(MAX_IMAGE_BYTES + 1)
-                name = store_image(self.ed.assets_dir, data)
-                return self._send(200, {"name": name, "size": len(data)})
+                data = self._body(MAX_UPLOAD_BYTES + 1)
+                if len(data) > MAX_UPLOAD_BYTES:
+                    raise ValueError(f"File is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB.")
+                name, stored, note = store_image(self.ed.assets_dir, data)
+                return self._send(200, {"name": name, "size": len(stored), "note": note})
             if path == "/api/upload":
                 self.ed.start_upload()
                 return self._send(200, {"ok": True})
@@ -681,16 +755,19 @@ async function prepare(file){
   return (scale === 1 && out.size >= file.size && file.type !== "image/webp") ? file : out;
 }
 async function uploadFiles(files){
-  const names = [];
+  const names = [], notes = [];
   for (const [i, f] of files.entries()){
     toast(`Processing image ${i + 1} of ${files.length}…`, 0);
     try {
       const blob = await prepare(f);
       const j = await (await api("/api/image", {method:"POST", headers:{"Content-Type": blob.type || "application/octet-stream"}, body: blob})).json();
+      if (j.error) throw new Error(j.error);
       sizes[j.name] = j.size; names.push(j.name);
-    } catch (e){ toast(e.message, 5000); return names; }
+      if (j.note) notes.push(j.note);
+    } catch (e){ toast(e.message, 6000); return names; }
   }
-  toast(files.length ? `${names.length} image${names.length > 1 ? "s" : ""} added` : "", 1600);
+  if (notes.length) toast(notes.join(" "), 6000);
+  else toast(files.length ? `${names.length} image${names.length > 1 ? "s" : ""} added` : "", 1600);
   return names;
 }
 function dropZone(text, multiple, onFiles){
@@ -818,9 +895,9 @@ function editor(b, sum){
     case "image": {
       const set = async fs => { const n = await uploadFiles(fs.slice(0, 1)); if (n.length){ b.file = n[0]; changed(true); } };
       return [
-        b.file ? el("img", {class:"thumb", src: "/" + b.file, alt:""}) : dropZone("Click or drop an image here", false, set),
+        b.file ? el("img", {class:"thumb", src: "/" + b.file, alt:""}) : dropZone("Click or drop an image here (PNG, JPG, WebP or animated GIF)", false, set),
         b.file ? el("div", {class:"row", style:"margin-top:8px"}, el("button", {class:"btn sm", onclick: async () => set(await pickFiles(false))}, "Replace image…"),
-                   el("span", {class:"hint", style:"margin:0;text-align:right"}, sizes[b.file] ? kb(sizes[b.file]) : "")) : null,
+                   el("span", {class:"hint", style:"margin:0;text-align:right"}, (b.file.endsWith(".gif") ? "Animated GIF · " : "") + (sizes[b.file] ? kb(sizes[b.file]) : ""))) : null,
         ...field("Caption (optional)", text(b, "caption", sum)),
         ...field("Description for screen readers", text(b, "alt", null, "e.g. Our team at the open day")),
         ...field("Width", seg([[100,"Full"],[75,"75%"],[50,"Half"]], b.width, v => { b.width = v; changed(); }))];

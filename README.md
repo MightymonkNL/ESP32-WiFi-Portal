@@ -113,6 +113,29 @@ Before the first install, build the firmware of all modules: `build_exe.bat` (or
 The backups contain WiFi passwords and survey answers: they stay on this PC (`admin/backups` is
 ignored by git).
 
+### External projects (Add project)
+
+The **+ Add project** card adds an existing ESP32 project that has a web installer (ESP Web Tools,
+used by many projects such as ESPHome, WLED or [Pocket Tank](https://pocketank.com/)). Paste a link:
+the project's website, install page, GitHub repository or `manifest.json`. The Toolbox finds the
+installer, shows name, version, board, source and license, and downloads the ESP32-S3 firmware to
+`admin/external/<project>` (ignored by git: it is someone else's software, under its own license).
+
+External firmware cannot talk to the Toolbox, so:
+
+- the Toolbox remembers which project it installed on which board (recognised by the MAC address the
+  ESP32-S3 reports over USB) and shows it as running there;
+- before another project is installed, its settings partitions (NVS and other small data partitions,
+  read from its partition table) are saved with esptool; installing it again writes them back, so for
+  example your Pocket Tank keeps its fish;
+- its project screen has the Firmware tab and an **About** tab with links, license,
+  **Check for update** and **Remove project**.
+
+Projects with another partition table (like Pocket Tank with its 7.5 MB model) overwrite the portal's
+files; installing the WiFi Portal again restores them and its WiFi settings from the automatic backup.
+Only add projects you trust: their firmware runs on your board. No code from an external project
+runs on your PC.
+
 ### WiFi Portal module
 
 | Tab | What you can do |
@@ -173,7 +196,9 @@ updates while you type (phone or desktop view). Changes are saved automatically;
 **Upload to ESP32** in the editor or the app to put the page on the board.
 
 Photos are resized to at most 1280 px before they are stored, so you can use photos straight
-from a phone. The board has about 3 MB of space for pages and images; the editor shows how much
+from a phone. **Animated GIFs** stay animated: small ones are stored as they are, larger ones are
+scaled down (all frames and timing kept, transparency too) until they are about 700 kB at most, so
+they fit on the board and load quickly on phones. The board has about 3 MB of space for pages and images; the editor shows how much
 your images use. With firmware 2.2 or newer, uploads skip images that are already on the board.
 
 When the app starts it downloads the page, survey settings and images from the board (stored there
@@ -242,6 +267,7 @@ and the app shows it on the WiFi tab.
 | `projects/template/` | Empty project to start a new one from |
 | `admin/toolbox.pyw`, `admin/espcore.py` | ESP32 Toolbox app (Python/Tkinter) and its shared code |
 | `admin/modules/` | One folder per project: `module.json`, `module.py`, `firmware/` |
+| `admin/external.py` | Add project: finding and downloading web-installer firmware, esptool backups |
 | `admin/build_modules.py` | Builds every module's firmware into its `firmware/` folder |
 | `build_exe.bat` | Builds the firmware and `ESP32 Toolbox.exe` |
 

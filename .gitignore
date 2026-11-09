@@ -16,6 +16,7 @@ admin/portal_content.json
 admin/portal_content.backup.json
 admin/portal_assets/
 admin/data/
+admin/external/
 admin/backups/
 
 # Built by build_modules.py

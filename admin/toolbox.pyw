@@ -24,6 +24,10 @@ from tkinter import messagebox, ttk
 import base64, copy, csv, hashlib, html, io, json, re, secrets, socket, socketserver  # noqa: E401,F401
 import uuid, webbrowser, zipfile, mimetypes, http.server, html.parser, urllib.parse  # noqa: E401,F401
 from tkinter import filedialog, simpledialog  # noqa: F401
+try:    # Pillow: the portal editor uses it to shrink large animated GIFs
+    import PIL.Image, PIL.ImageSequence, PIL.GifImagePlugin  # noqa: E401,F401
+except ImportError:
+    pass
 
 try:
     import serial  # noqa: F401
@@ -36,6 +40,7 @@ except ImportError:  # pragma: no cover
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import espcore as core  # noqa: E402
+import external  # noqa: E402
 from espcore import (BG, CARD, SURFACE2, SURFACE3, TEXT, MUTED, PRIMARY, SECONDARY, SUCCESS,  # noqa: E402
                      IDLE, FONT)
 
@@ -142,12 +147,14 @@ class Toolbox(tk.Tk):
         grid.pack(fill="x")
         grid.columnconfigure(0, weight=1, uniform="c")
         grid.columnconfigure(1, weight=1, uniform="c")
-        for i, m in enumerate(self.modules):
-            self._card(grid, m).grid(row=i // 2, column=i % 2, sticky="nsew",
-                                     padx=(0, 8) if i % 2 == 0 else (8, 0), pady=(0, 16))
+        cards = [self._card(grid, m) for m in self.modules] + [self._add_card(grid)]
+        for i, card in enumerate(cards):
+            card.grid(row=i // 2, column=i % 2, sticky="nsew", padx=(0, 8) if i % 2 == 0 else (8, 0),
+                      pady=(0, 16))
         hint = core.label(wrap, "Open a project to work with it. Installing or updating a project on the "
-                                "ESP32 is done in the project's Firmware tab. A new project: see "
-                                "admin/modules/README.md.", color=MUTED, size=9, bg=BG)
+                                "ESP32 is done in the project's Firmware tab. Add project: an existing ESP32 "
+                                "project from its website or GitHub (with a web installer).",
+                          color=MUTED, size=9, bg=BG)
         hint.configure(wraplength=460, justify="left")
         hint.pack(fill="x")
         self._fit()
@@ -158,8 +165,8 @@ class Toolbox(tk.Tk):
         desc = tk.Label(card, text=m.description, bg=SURFACE2, fg=MUTED, font=(FONT, 9), anchor="w",
                         justify="left", wraplength=200)
         desc.pack(fill="x", pady=(4, 8))
-        tk.Label(card, text=f"Version {m.version}", bg=SURFACE2, fg=MUTED, font=(FONT, 9),
-                 anchor="w").pack(fill="x")
+        tk.Label(card, text=f"Version {m.version}" + ("  ·  external" if m.external else ""),
+                 bg=SURFACE2, fg=MUTED, font=(FONT, 9), anchor="w").pack(fill="x")
         text, color = self._badge(m)
         if text:
             tk.Label(card, text=text, bg=SURFACE2, fg=color, font=(FONT, 9, "bold"), anchor="w").pack(
@@ -174,6 +181,18 @@ class Toolbox(tk.Tk):
             w.bind("<Button-1>", lambda e, mod=m: self.open_project(mod))
             w.bind("<Enter>", lambda e: hover(True))
             w.bind("<Leave>", lambda e: hover(False))
+        card.bind("<Configure>", lambda e: desc.configure(wraplength=max(120, e.width - 34)))
+        return card
+
+    def _add_card(self, parent):
+        card = tk.Frame(parent, bg=BG, padx=16, pady=14, cursor="hand2", highlightthickness=1,
+                        highlightbackground=SURFACE3)
+        tk.Label(card, text="+  Add project", bg=BG, fg=PRIMARY, font=(FONT, 12, "bold"), anchor="w").pack(fill="x")
+        desc = tk.Label(card, text="From a website, GitHub or an installer link, e.g. pocketank.com",
+                        bg=BG, fg=MUTED, font=(FONT, 9), anchor="w", justify="left", wraplength=200)
+        desc.pack(fill="x", pady=(4, 0))
+        for w in (card, *card.winfo_children()):
+            w.bind("<Button-1>", lambda e: self.add_project())
         card.bind("<Configure>", lambda e: desc.configure(wraplength=max(120, e.width - 34)))
         return card
 
@@ -317,12 +336,14 @@ class Toolbox(tk.Tk):
         elif not b.get("app"):
             fw["board"].set("no Toolbox project")
         else:
-            fw["board"].set(f"{self._app_name(b['app'])} {b.get('fw') or '?'}")
+            fw["board"].set(f"{self._app_name(b['app'])} {b.get('fw') or '?'}"
+                            + (" (installed by the Toolbox)" if b.get("external") else ""))
         label, state, color, primary = "Install", "", MUTED, True
         if not b:
             state = "Connect the ESP32 to install this project."
         elif not built:
-            state = "Build the firmware first: build_exe.bat or python admin\\build_modules.py."
+            state = ("Download the firmware again: About tab, Check for update." if m.external else
+                     "Build the firmware first: build_exe.bat or python admin\\build_modules.py.")
         elif b.get("app") != m.id:
             label = f"Install {m.name} on the ESP32"
             state = (f"Installing replaces {self._app_name(b['app'])} on the ESP32 (it is backed up first)."
@@ -504,18 +525,27 @@ class Toolbox(tk.Tk):
                 except ValueError:
                     info = {}
             self._set_board(port, reply, info)
-            if not info:
-                self.set_status(f"{port}: no Toolbox project recognised on this ESP32. Open a project and "
-                                "install it.", SECONDARY)
-            else:
+            b = self.board
+            if info:
+                core.set_board_record(b["mac"], b["app"], b["fw"])
                 self.set_status(f"Connected to {port}", SUCCESS)
+            else:
+                rec = core.board_record(b["mac"])
+                m = self._module(rec["app"]) if rec else None
+                if m is not None and m.external:
+                    b.update(app=m.id, fw=rec.get("fw"), external=True)
+                    self.set_status(f"Connected to {port}. {m.name} was installed on this ESP32 by the Toolbox.",
+                                    SUCCESS)
+                else:
+                    self.set_status(f"{port}: no Toolbox project recognised on this ESP32. Open a project and "
+                                    "install it.", SECONDARY)
             self._board_changed()
 
         self.run_bg(work, done, f"Connecting to {port}…")
 
     def _set_board(self, port, reply, info, mac=None):
         self.board = {"port": port, "app": core.app_of(info), "fw": info.get("fw"),
-                      "mac": info.get("mac") or mac or (self.board or {}).get("mac"), "reply": reply}
+                      "mac": core.norm_mac(info.get("mac") or mac or core.port_mac(port)), "reply": reply}
         self.connection += 1
 
     def _board_changed(self):
@@ -526,7 +556,8 @@ class Toolbox(tk.Tk):
         elif not b.get("app"):
             self.board_var.set(f"{b['port']}  ·  no Toolbox project")
         else:
-            self.board_var.set(f"{self._app_name(b['app'])} {b.get('fw') or ''}  ·  {b['port']}")
+            self.board_var.set(f"{self._app_name(b['app'])} {b.get('fw') or ''}  ·  {b['port']}"
+                               + ("  ·  installed by the Toolbox" if b.get("external") else ""))
         if self.view is None:
             if not self.busy:
                 self.show_home()           # badges
@@ -534,7 +565,7 @@ class Toolbox(tk.Tk):
         self._update_banner()
         self._apply_lock()
         self._refresh_firmware()
-        if self._runs(self.view.module.id) and self.notified != (self.view, self.connection):
+        if self._runs(self.view.module.id) and b.get("reply") and self.notified != (self.view, self.connection):
             self.notified = (self.view, self.connection)
             self.view.connected(b["port"], b["reply"])
 
@@ -561,6 +592,8 @@ class Toolbox(tk.Tk):
 
         if self.view is not None:
             self.view.save_state()
+        mac0 = b.get("mac") or core.port_mac(port)
+        restore_from = core.latest_backup(mac0, module.id) if module.external and not same and mac0 else None
         backup = None
         if old_app:
             old = self._module(old_app)
@@ -575,25 +608,40 @@ class Toolbox(tk.Tk):
             if backup:
                 tmp = os.path.join(tempfile.gettempdir(), f"toolbox-backup-{old_app}.zip")
                 backup(port, tmp)
+            extra, labels = external.restore_parts(module, restore_from) if restore_from else ([], [])
             try:
-                mac = core.flash(port, module, report)
+                mac = core.flash(port, module, report, extra)
             except Exception:
                 if tmp:     # keep the backup even when flashing fails
                     shutil.move(tmp, core.new_backup_path(b.get("mac"), old_app))
                 raise
-            mac = b.get("mac") or mac
+            mac = core.norm_mac(mac0 or mac)
             saved = None
             if tmp:
                 saved = core.new_backup_path(mac, old_app)
                 shutil.move(tmp, saved)
                 core.prune_backups(mac, old_app)
-            return mac, saved, core.wait_for_info(port)
+            reply = None if module.external else core.wait_for_info(port)
+            return mac, saved, reply, labels
 
         def done(result):
-            mac, saved, reply = result
-            self._installed(port, module, mac, saved, reply, same)
+            mac, saved, reply, labels = result
+            if module.external:
+                self._installed_external(port, module, mac, saved, labels)
+            else:
+                self._installed(port, module, mac, saved, reply, same)
 
         self.run_bg(work, done, f"Installing {module.name}…", progress_total=total)
+
+    def _installed_external(self, port, module, mac, saved, labels):
+        self.board = {"port": port, "app": module.id, "fw": module.version, "mac": mac, "reply": None,
+                      "external": True}
+        self.connection += 1
+        core.set_board_record(mac, module.id, module.version)
+        note = f" Backup of the previous project: {os.path.relpath(saved, core.BASE)}." if saved else ""
+        kept = f" Its saved settings ({', '.join(labels)}) were put back." if labels else ""
+        self.set_status(f"{module.name} installed.{kept}{note}", SUCCESS)
+        self._board_changed()
 
     def _installed(self, port, module, mac, saved, reply, same):
         try:
@@ -601,6 +649,7 @@ class Toolbox(tk.Tk):
         except ValueError:
             info = {}
         self._set_board(port, reply, info, mac)
+        core.set_board_record(self.board["mac"], self.board["app"], self.board["fw"])
         note = f" Backup of the previous project: {os.path.relpath(saved, core.BASE)}." if saved else ""
         if core.app_of(info) != module.id:
             self._board_changed()
@@ -617,6 +666,117 @@ class Toolbox(tk.Tk):
             view.show_firmware(False)
         if view is not None and backup:
             view.restore_after_install(port, reply, backup)
+
+    # ================================================================ external projects
+    def reload_modules(self):
+        self.modules = core.find_modules()
+
+    def reload_project(self, module_id, message=None):
+        self.reload_modules()
+        m = self._module(module_id)
+        if m:
+            self.open_project(m)
+            if self.view is not None:
+                self.view.show_firmware(True)
+        if message:
+            self.set_status(message, SUCCESS)
+
+    def remove_project(self, module):
+        if self.busy:
+            return
+        self._clear_area()
+        shutil.rmtree(module.folder, ignore_errors=True)
+        self.reload_modules()
+        self.show_home()
+        self.set_status(f"{module.name} removed from the Toolbox.", SUCCESS)
+
+    def add_project(self):
+        if self.busy:
+            return
+        dlg = tk.Toplevel(self, bg=CARD, padx=20, pady=18)
+        dlg.title("Add project")
+        dlg.transient(self)
+        dlg.resizable(False, False)
+        core.label(dlg, "Add project", bold=True, size=12).pack(fill="x")
+        intro = core.label(dlg, "Paste the link of an ESP32 project with a web installer: its website, install "
+                                "page, GitHub repository or manifest.json.", color=MUTED, size=9)
+        intro.configure(wraplength=420, justify="left")
+        intro.pack(fill="x", pady=(2, 10))
+        url_var = tk.StringVar()
+        entry = ttk.Entry(dlg, textvariable=url_var, font=(FONT, 10), width=52)
+        entry.pack(fill="x")
+        entry.focus_set()
+        result = tk.Label(dlg, text="", bg=CARD, fg=TEXT, font=(FONT, 9), anchor="w", justify="left",
+                          wraplength=420)
+        result.pack(fill="x", pady=(10, 0))
+        warn = core.label(dlg, "", color=SECONDARY, size=9)
+        warn.configure(wraplength=420, justify="left")
+        warn.pack(fill="x", pady=(6, 0))
+        row = tk.Frame(dlg, bg=CARD)
+        row.pack(fill="x", pady=(14, 0))
+        state = {"found": None}
+
+        def find():
+            url = url_var.get().strip()
+            if not url or self.busy:
+                return
+            state["found"] = None
+            add_btn.configure(state="disabled")
+            result.configure(text="Searching…", fg=MUTED)
+            warn.configure(text="")
+
+            def done(found):
+                self.set_status(f"Found {found['manifest'].get('name', 'the project')}.", SUCCESS)
+                if not dlg.winfo_exists():
+                    return
+                try:
+                    lines = external.describe(found)
+                except ValueError as exc:
+                    result.configure(text=str(exc), fg=SECONDARY)
+                    self.set_status(str(exc), SECONDARY)
+                    return
+                state["found"] = found
+                result.configure(text="\n".join(lines), fg=TEXT)
+                board = str(found["manifest"].get("board_name") or found["manifest"].get("board") or "")
+                if board and not re.search(r"1\.8|amoled", board, re.I):
+                    warn.configure(text="This firmware is made for another board. It may not work on yours.")
+                else:
+                    warn.configure(text="The firmware runs on your ESP32: only add projects you trust.")
+                add_btn.configure(state="normal")
+
+            def failed_ok(_r):
+                try:
+                    return external.find_manifest(url)
+                except Exception as exc:  # noqa: BLE001
+                    return exc
+
+            def failed(exc):
+                self.set_status(str(exc), SECONDARY)
+                if dlg.winfo_exists():
+                    result.configure(text=str(exc), fg=SECONDARY)
+
+            self.run_bg(failed_ok, lambda r: failed(r) if isinstance(r, Exception) else done(r),
+                        "Looking for the project's installer…")
+
+        def add():
+            found = state["found"]
+            if not found or self.busy:
+                return
+            m = found["manifest"]
+            mid = external.free_id(m.get("name") or "project", self.modules, found["manifest_url"])
+            dlg.destroy()
+            self.run_bg(lambda r: external.download(found, r, mid),
+                        lambda _f: self.reload_project(mid, f"{m.get('name')} added. Install it on the ESP32 "
+                                                            "with the button below."),
+                        f"Downloading {m.get('name')}…", progress_total=8 * 1024 * 1024)
+
+        core.button(row, "Find", find, small=True).pack(side="left")
+        add_btn = core.button(row, "Add project", add, small=True)
+        add_btn.pack(side="left", padx=(8, 0))
+        add_btn.configure(state="disabled")
+        core.ghost(row, "Cancel", dlg.destroy, small=True).pack(side="right")
+        entry.bind("<Return>", lambda e: find())
+        dlg.grab_set()
 
     def _quit(self):
         if self.view is not None:

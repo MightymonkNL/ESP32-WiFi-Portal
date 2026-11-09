@@ -1578,22 +1578,32 @@ class Module(core.BaseModule):
         write_backup(path, store, board, log, extra)
 
     def restore_after_install(self, port, reply, path):
-        """The portal was installed again. Flashing keeps the files and settings on the board,
-        so usually everything is still there; only when the portals are gone (another project
-        erased them) the last backup is put back."""
+        """The portal was installed again. Flashing keeps the files and settings on the board when
+        the other project used the same partition table, so usually everything is still there.
+        When the portals are gone, or the WiFi settings differ from the backup (another project
+        overwrote the settings area), the last backup is put back."""
+        try:
+            meta = read_backup(path)[0]
+            wanted = (meta.get("board") or {}).get("wifi")
+        except (OSError, ValueError):
+            wanted = None
+
         def work(_r):
             with Board(port) as b:
-                return b.get_file(BOARD_CONTENT)
+                return b.get_file(BOARD_CONTENT), b.wifi()
 
-        def done(data):
-            if data:
+        def done(result):
+            data, wifi = result
+            wifi_lost = bool(wanted and wifi and (wifi["ssid"], wifi["pass"]) != (wanted["ssid"], wanted["pass"]))
+            if data and not wifi_lost:
                 self.set_status("WiFi Portal installed; the portals and settings were still on the board.",
                                 SUCCESS)
                 self.connected(port, reply)
-            else:
-                self._show_info(parse_info(reply))
-                self.set_status("The portals are gone from the board: restoring the last backup…", PRIMARY)
-                self._restore_path(path, confirm=False)
+                return
+            self._show_info(parse_info(reply))
+            why = "The portals are gone from the board" if not data else "The WiFi settings were changed"
+            self.set_status(f"{why}: restoring the last backup…", PRIMARY)
+            self._restore_path(path, confirm=False)
 
         self.run_bg(work, done, "Checking the portals on the board…")
 

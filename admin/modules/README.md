@@ -1,5 +1,8 @@
 # Toolbox modules
 
+> Projects added with **+ Add project** (from a website or GitHub) are stored in `admin/external`
+> instead; they need no module.py. See the main README, *External projects*.
+
 Every folder here is one project the ESP32 Toolbox can manage. The Toolbox loads them at start-up,
 so adding a project needs no new exe: copy the folder next to the exe (`admin/modules/<id>`).
 

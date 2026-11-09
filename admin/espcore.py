@@ -13,6 +13,7 @@ import importlib.util
 import json
 import os
 import re
+import struct
 import subprocess
 import sys
 import threading
@@ -35,6 +36,7 @@ if getattr(sys, "frozen", False):
 else:
     BASE = os.path.dirname(os.path.abspath(__file__))
 MODULES_DIR = os.path.join(BASE, "modules")
+EXTERNAL_DIR = os.path.join(BASE, "external")    # projects added from a link (downloaded, not in git)
 DATA_DIR = os.path.join(BASE, "data")          # per module: data/<id>/ (stays on this PC)
 BACKUP_DIR = os.path.join(BASE, "backups")     # per board: backups/<mac>/<module>-<time>.zip
 TOOLS_DIR = os.path.join(BASE, "tools")
@@ -60,6 +62,26 @@ def save_settings(settings):
     os.makedirs(DATA_DIR, exist_ok=True)
     with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
         json.dump(settings, f, indent=2)
+
+
+def norm_mac(mac):
+    mac = (mac or "").strip().lower().replace("-", ":")
+    return mac if re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac) else None
+
+
+def board_record(mac):
+    """{"app", "fw", "at"} of what the Toolbox last installed on this board, or None."""
+    mac = norm_mac(mac)
+    return load_settings().get("boards", {}).get(mac) if mac else None
+
+
+def set_board_record(mac, app, fw):
+    mac = norm_mac(mac)
+    if not mac or not app:
+        return
+    settings = load_settings()
+    settings.setdefault("boards", {})[mac] = {"app": app, "fw": fw, "at": time.strftime("%Y-%m-%d %H:%M")}
+    save_settings(settings)
 
 
 # ============================================================================ theme
@@ -155,6 +177,14 @@ def find_ports():
         ports.append((p.device, f"{p.device} — {'ESP32-S3' if is_esp else p.description}", is_esp))
     ports.sort(key=lambda x: (not x[2], x[0]))
     return ports
+
+
+def port_mac(port):
+    """MAC address of the board on `port` from its USB serial number (ESP32-S3), or None."""
+    for p in list_ports.comports():
+        if p.device == port:
+            return norm_mac(p.serial_number)
+    return None
 
 
 def to_hex(text):
@@ -303,6 +333,8 @@ class ModuleInfo:
         self.version = str(meta.get("version", "?"))
         self.chip = meta.get("chip", "esp32s3")
         self.flash = meta.get("flash", {})          # {"0x0": "bootloader.bin", ...}
+        self.external = meta.get("kind") == "external" or             os.path.dirname(os.path.abspath(folder)) == os.path.abspath(EXTERNAL_DIR)   # never runs module.py
+        self.source = meta.get("source", {})
 
     def firmware_files(self):
         """[(offset, path)] or None when a file is missing (firmware not built yet)."""
@@ -317,8 +349,13 @@ class ModuleInfo:
         return out
 
     def load_class(self):
-        """The Module class from module.py (loaded once)."""
+        """The Module class from module.py (loaded once). External projects never run code from
+        their folder: they use the Toolbox's own screen (external.ExternalModule)."""
         if getattr(self, "_cls", None):
+            return self._cls
+        if self.external:
+            import external
+            self._cls = external.ExternalModule
             return self._cls
         if self.folder not in sys.path:
             sys.path.insert(0, self.folder)        # module.py may import files from its own folder
@@ -332,7 +369,8 @@ class ModuleInfo:
 
 def find_modules():
     mods = []
-    for path in sorted(glob.glob(os.path.join(MODULES_DIR, "*", "module.json"))):
+    paths = glob.glob(os.path.join(MODULES_DIR, "*", "module.json")) +         glob.glob(os.path.join(EXTERNAL_DIR, "*", "module.json"))
+    for path in sorted(paths):
         try:
             mods.append(ModuleInfo(os.path.dirname(path)))
         except (OSError, ValueError, KeyError):
@@ -357,24 +395,13 @@ def find_esptool():
     return None
 
 
-def flash(port, module, report=None):
-    """Writes the module's firmware; returns the board's MAC address (or None).
-
-    Only the bootloader, partition table and app are written: the settings (NVS)
-    and files (LittleFS) of other projects stay on the board.
-    """
-    files = module.firmware_files()
-    if not files:
-        raise FileNotFoundError(f"The firmware of “{module.name}” is missing in {module.folder}\\firmware. "
-                                "Build it first (build_modules.bat).")
+def run_esptool(port, chip, command, report=None, regions=None, after="hard-reset"):
+    """Runs esptool; returns (mac, output lines). regions: [(offset, size)] for write progress."""
     tool = find_esptool()
     if not tool:
         raise FileNotFoundError(f"esptool.exe not found. Put it in {TOOLS_DIR} (build_modules.bat does this).")
-    regions = [(off, os.path.getsize(p)) for off, p in files]
-    args = tool + ["--chip", module.chip, "--port", port, "--baud", "921600",
-                   "--before", "default-reset", "--after", "hard-reset", "write-flash", "-z"]
-    for off, path in files:
-        args += [hex(off), path]
+    args = tool + ["--chip", chip, "--port", port, "--baud", "921600",
+                   "--before", "default-reset", "--after", after] + command
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     proc = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=flags)
     out, mac, line = [], None, b""
@@ -394,7 +421,7 @@ def flash(port, module, report=None):
         if m:
             mac = m.group(1).lower()
         m = re.search(r"Writing at 0x([0-9a-fA-F]+)", text)
-        if m and report:
+        if m and report and regions:
             addr, done = int(m.group(1), 16), 0
             for off, size in regions:
                 if addr >= off + size:
@@ -404,10 +431,62 @@ def flash(port, module, report=None):
             report(done)
     if proc.wait() != 0:
         tail = " ".join(t for t in out[-4:] if t)
-        raise RuntimeError(f"Flashing failed: {tail or 'esptool stopped'}")
+        raise RuntimeError(f"esptool failed: {tail or 'stopped'}")
+    return mac, out
+
+
+def flash(port, module, report=None, extra=None, after="hard-reset"):
+    """Writes the module's firmware (plus extra [(offset, path)], e.g. restored settings);
+    returns the board's MAC address (or None).
+
+    Only these parts are written, never a full erase: settings (NVS) and files (LittleFS)
+    of other projects stay on the board where the partition tables allow it.
+    """
+    files = module.firmware_files()
+    if not files:
+        raise FileNotFoundError(f"The firmware of “{module.name}” is missing in {module.folder}\\firmware. "
+                                + ("Download it again (About tab)." if module.external
+                                   else "Build it first (build_modules.bat)."))
+    files = sorted(files + list(extra or []))
+    regions = [(off, os.path.getsize(p)) for off, p in files]
+    command = ["write-flash", "-z"]
+    for off, path in files:
+        command += [hex(off), path]
+    mac, _ = run_esptool(port, module.chip, command, report, regions, after)
     if report:
         report(sum(size for _, size in regions))
     return mac
+
+
+def read_flash(port, chip, offset, size, path, after="hard-reset"):
+    """Reads a flash region into a file; returns the MAC address."""
+    mac, _ = run_esptool(port, chip, ["read-flash", hex(offset), hex(size), path], after=after)
+    return mac
+
+
+def parse_partitions(data):
+    """[{"label", "type", "subtype", "offset", "size"}] from a partition table image."""
+    parts = []
+    for i in range(0, len(data) - 31, 32):
+        entry = data[i:i + 32]
+        if entry[:2] != b"\xaa\x50":
+            break
+        ptype, subtype, offset, size = struct.unpack_from("<BBII", entry, 2)
+        label = entry[12:28].split(b"\x00")[0].decode("ascii", errors="replace")
+        parts.append({"label": label, "type": ptype, "subtype": subtype, "offset": offset, "size": size})
+    return parts
+
+
+def settings_partitions(parts, max_size=256 * 1024):
+    """Data partitions that hold settings: NVS always, other small data partitions too
+    (not otadata, phy_init or coredump; big file systems and models come with the firmware)."""
+    out = []
+    for p in parts:
+        if p["type"] != 1 or p["subtype"] in (0x00, 0x01, 0x03):
+            continue
+        if p["subtype"] == 0x02 or p["size"] <= max_size:
+            out.append(p)
+    return out
 
 
 def flash_size(module):
