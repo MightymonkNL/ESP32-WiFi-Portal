@@ -461,7 +461,7 @@ static void handleAnswer() {
 // The MAC addresses are kept in RAM only: never logged or stored, gone after a restart.
 
 #define LEAVE_DELAY_MS 1500UL
-#define LEAVE_BLOCK_MS 120000UL
+#define LEAVE_BLOCK_MS 30000UL
 #define MAX_LEFT 8
 struct LeftDevice { uint8_t mac[6]; unsigned long since; bool used; };
 static LeftDevice leftDevices[MAX_LEFT];

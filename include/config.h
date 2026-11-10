@@ -1,6 +1,6 @@
 #pragma once
 
-#define FW_VERSION "2.8"
+#define FW_VERSION "2.9"
 // Project id for the ESP32 Toolbox app (must match admin/modules/portal/module.json)
 #define APP_ID "portal"
 

@@ -213,7 +213,7 @@ your images use. With firmware 2.2 or newer, uploads skip images that are alread
 **Content warning** (the editor's **Warning** tab, per portal): a screen in front of the page with an
 optional round logo, a heading, text and two buttons. **Enter** shows the page (remembered while
 that browser tab stays open); **Leave** shows a goodbye message. With firmware 2.8 or newer the board
-then disconnects that phone and refuses it for 2 minutes, so it does not rejoin and open the portal
+then disconnects that phone and refuses it for 30 seconds, so it does not rejoin and open the portal
 again. Older firmware cannot disconnect it, so the page tells the visitor to turn off WiFi. The
 preview shows the warning while the Warning tab is open.
 
@@ -238,7 +238,7 @@ Each answer is stored as one line in `/responses.csv` on the board:
 - *time* is the visitor's phone clock; *device* is a coarse type such as `iPhone (iOS 18)` or `Android 15 (Samsung)`.
 - No IP addresses, MAC addresses or names are written to the log.
 - **Leave** (content warning): the board keeps the MAC addresses of phones that chose Leave in RAM
-  only, for 2 minutes, to keep them off the network. They are never logged or stored, and a restart clears them.
+  only, for 30 seconds, to keep them off the network. They are never logged or stored, and a restart clears them.
 - **One answer per device per question:** the board keeps a salted SHA-256 hash of the device's
   MAC address in `/voters.txt` (the random salt never leaves the board). This file is never exported;
   **Clear log** deletes it together with the answers. A new question starts with an empty list.

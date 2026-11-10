@@ -1019,7 +1019,7 @@ function renderWarn(){
       el("div", {}, ...field("Enter button", text(w, "enter", null, "Enter"))),
       el("div", {}, ...field("Leave button", text(w, "leave", null, "Leave")))),
     ...field("Message after Leave", text(w, "bye")),
-    el("p", {class:"hint"}, "Leave disconnects the phone with firmware 2.8 or newer; it then cannot rejoin for 2 minutes. "
+    el("p", {class:"hint"}, "Leave disconnects the phone with firmware 2.8 or newer; it then cannot rejoin for 30 seconds. "
                           + "With older firmware the phone shows how to leave instead. In the preview, Enter and Leave can be clicked."));
 }
 
