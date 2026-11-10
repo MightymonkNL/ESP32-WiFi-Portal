@@ -1,7 +1,8 @@
 @echo off
 rem Builds the firmware of all modules (admin\modules\*\firmware) and
 rem "ESP32 Toolbox.exe" in this folder. Run again after changing a project or the app.
-rem Requires Python 3 and PlatformIO.
+rem Requires Python 3; PlatformIO is installed automatically when it is missing
+rem (the first build then downloads the ESP32 toolchain, about 1 GB).
 cd /d "%~dp0"
 python -m pip install --user --quiet pyinstaller pyserial pillow || goto :error
 python admin\build_modules.py || goto :error

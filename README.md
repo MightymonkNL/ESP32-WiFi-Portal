@@ -218,7 +218,9 @@ Survey answers, voter keys and the app settings on the board can only be read ov
 Your editor content is stored locally in `admin/data/portal/` (ignored by git). Content of the
 old Portal Admin app (`admin/portal_content.json`, `admin/portal_assets/`) is moved there on the first start.
 
-To build the exe yourself, run `build_exe.bat` (needs Python 3 and PlatformIO).
+To build the exe yourself, run `build_exe.bat`. It needs Python 3; when PlatformIO is not installed it is
+installed with pip, and the first build downloads the ESP32 toolchain (about 1 GB). Only to *use* the
+Toolbox on another PC you do not need to build anything: use the package (`dist/ESP32-Toolbox-<date>.zip`).
 
 ## 5. Survey and privacy
 
