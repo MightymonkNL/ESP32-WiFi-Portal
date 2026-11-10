@@ -14,7 +14,9 @@ python -m PyInstaller --noconfirm --clean --onefile --windowed ^
   --specpath "%TEMP%\esp32-toolbox-build" ^
   "admin\toolbox.pyw" || goto :error
 echo.
+python admin\make_package.py || goto :error
 echo Done: "%~dp0ESP32 Toolbox.exe"
+echo Package for another PC: dist\ESP32-Toolbox-^<date^>.zip
 echo The exe uses the modules in admin\modules and esptool in admin\tools next to it.
 pause
 exit /b 0

@@ -78,6 +78,11 @@ If uploading fails, put the board in download mode: hold **BOOT**, press **RESET
 Start it with **`ESP32 Toolbox.exe`**, or from source with `admin\ESP32 Toolbox.bat`
 (needs Python 3 + pyserial). Close the PlatformIO serial monitor first: only one program can use the COM port.
 
+**On another PC:** `build_exe.bat` also makes `dist/ESP32-Toolbox-<date>.zip`: the exe with the
+projects, their firmware and esptool, without your personal data. Unzip it anywhere and start
+`ESP32 Toolbox.exe`; the WiFi Portal downloads its portals and settings from the board. Projects
+added with **+ Add project** are added again on that PC.
+
 The Toolbox starts with the **projects**: one card per project, and at the top which project runs
 on the connected ESP32 (marked **On the ESP32** on its card). Click a card to open the project;
 **← Projects** goes back. The projects are loose folders in `admin/modules` next to the exe, so a
