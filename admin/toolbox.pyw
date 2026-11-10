@@ -63,6 +63,7 @@ class Toolbox(tk.Tk):
         self._build()
         self.show_home()
         self.after(100, self.refresh_ports)
+        self.after(1500, self.check_updates)          # external projects: newer version online?
         self.protocol("WM_DELETE_WINDOW", self._quit)
 
     # ================================================================ layout
@@ -198,6 +199,10 @@ class Toolbox(tk.Tk):
 
     def _badge(self, m):
         b = self.board
+        online = self.online_update(m)
+        if online:
+            on = "\u25cf On the ESP32  \u00b7  " if b and b.get("app") == m.id else ""
+            return f"{on}Update available: {online}", SECONDARY
         if b and b.get("app") == m.id:
             if m.firmware_files() and b.get("fw") and b["fw"] != m.version:
                 return f"● On the ESP32  ·  update {b['fw']} → {m.version}", SECONDARY
@@ -339,7 +344,14 @@ class Toolbox(tk.Tk):
             fw["board"].set(f"{self._app_name(b['app'])} {b.get('fw') or '?'}"
                             + (" (installed by the Toolbox)" if b.get("external") else ""))
         label, state, color, primary = "Install", "", MUTED, True
-        if not b:
+        command = lambda: self.install(m)  # noqa: E731
+        online = self.online_update(m)
+        if online:
+            label, color = f"Download {online}", SECONDARY
+            state = (f"Update available online: {online} (the Toolbox has {m.version}). Download it, then "
+                     "install it on the ESP32.")
+            command = lambda: self.download_update(m)  # noqa: E731
+        elif not b:
             state = "Connect the ESP32 to install this project."
         elif not built:
             state = ("Download the firmware again: About tab, Check for update." if m.external else
@@ -353,10 +365,11 @@ class Toolbox(tk.Tk):
                 SECONDARY
         else:
             label, state, color, primary = f"Reinstall {m.version}", "Installed and up to date.", SUCCESS, False
-        fw["install"].configure(text=label, bg=PRIMARY if primary else SURFACE2,
+        enabled = (online or (b and built)) and not self.busy
+        fw["install"].configure(text=label, command=command, bg=PRIMARY if primary else SURFACE2,
                                 fg=core.ON_PRIMARY if primary else PRIMARY,
                                 activebackground=core.PRIMARY_LIGHT if primary else SURFACE3,
-                                state="normal" if (b and built and not self.busy) else "disabled")
+                                state="normal" if enabled else "disabled")
         fw["state"].set(state)
         fw["state_lbl"].configure(fg=color)
 
@@ -666,6 +679,103 @@ class Toolbox(tk.Tk):
             view.show_firmware(False)
         if view is not None and backup:
             view.restore_after_install(port, reply, backup)
+
+    # ================================================================ updates of external projects
+    UPDATE_EVERY = 6 * 3600          # seconds between automatic checks per project
+
+    def online_update(self, m):
+        """Newer version of an external project found online, or None."""
+        if not m.external:
+            return None
+        u = core.load_settings().get("updates", {}).get(m.id) or {}
+        latest = u.get("latest")
+        return latest if latest and latest != m.version and u.get("for") == m.version else None
+
+    def _save_update(self, module_id, version_for, latest):
+        settings = core.load_settings()
+        settings.setdefault("updates", {})[module_id] = {"checked": time.time(), "for": version_for,
+                                                        "latest": latest}
+        core.save_settings(settings)
+
+    def check_updates(self, force=False):
+        """Checks the external projects for a newer version in the background (no busy state)."""
+        cache = core.load_settings().get("updates", {})
+        todo = [m for m in self.modules if m.external and
+                (force or time.time() - (cache.get(m.id) or {}).get("checked", 0) > self.UPDATE_EVERY)]
+        if not todo:
+            return
+        q = queue.Queue()
+
+        def worker():
+            for m in todo:
+                try:
+                    found = external.find_manifest(m.source.get("manifest") or m.source.get("url"))
+                    q.put((m.id, m.version, str(found["manifest"].get("version") or "")))
+                except Exception:  # noqa: BLE001  (offline: try again next time)
+                    q.put((m.id, m.version, None))
+            q.put(None)
+
+        def poll():
+            changed = False
+            try:
+                while True:
+                    item = q.get_nowait()
+                    if item is None:
+                        if changed:
+                            self._updates_changed()
+                        return
+                    mid, version_for, latest = item
+                    if latest:
+                        self._save_update(mid, version_for, latest)
+                        changed = changed or latest != version_for
+            except queue.Empty:
+                pass
+            self.after(300, poll)
+
+        threading.Thread(target=worker, daemon=True).start()
+        self.after(300, poll)
+
+    def _updates_changed(self):
+        names = [m.name for m in self.modules if self.online_update(m)]
+        if names:
+            self.set_status(f"Update available for {', '.join(names)}.", SECONDARY)
+        if self.view is None:
+            if not self.busy:
+                self.show_home()
+        else:
+            self._refresh_firmware()
+
+    def check_update_now(self, m):
+        """About tab: check this project now and say the result."""
+        def work(_r):
+            return str(external.find_manifest(m.source.get("manifest") or m.source.get("url"))["manifest"]
+                       .get("version") or "")
+
+        def done(latest):
+            self._save_update(m.id, m.version, latest)
+            if latest and latest != m.version:
+                self.set_status(f"{m.name} {latest} is available. Download it in the Firmware tab.", SECONDARY)
+                if self.view is not None:
+                    self.view.show_firmware(True)
+            else:
+                self.set_status(f"{m.name} is up to date ({m.version}).", SUCCESS)
+            self._refresh_firmware()
+
+        self.run_bg(work, done, f"Checking {m.name} for an update\u2026")
+
+    def download_update(self, m):
+        def work(report):
+            found = external.find_manifest(m.source.get("manifest") or m.source.get("url"))
+            found["url"] = m.source.get("url") or found["url"]
+            external.download(found, report, m.id)
+            return str(found["manifest"].get("version") or "?")
+
+        def done(version):
+            self._save_update(m.id, version, version)
+            self.reload_project(m.id, f"Downloaded {m.name} {version}. Install it on the ESP32 with the button "
+                                      "below; its saved settings stay.")
+
+        self.run_bg(work, done, f"Downloading {m.name}\u2026", progress_total=8 * 1024 * 1024)
 
     # ================================================================ external projects
     def reload_modules(self):

@@ -129,7 +129,10 @@ External firmware cannot talk to the Toolbox, so:
   read from its partition table) are saved with esptool; installing it again writes them back, so for
   example your Pocket Tank keeps its fish;
 - its project screen has the Firmware tab and an **About** tab with links, license,
-  **Check for update** and **Remove project**.
+  **Check for update** and **Remove project**;
+- **updates:** at start-up (at most every 6 hours per project) the Toolbox checks the project's
+  installer for a newer version. A newer version shows as **Update available** on the project card and
+  in the Firmware tab: **Download** fetches it, then **Update to …** installs it (its saved settings stay).
 
 Projects with another partition table (like Pocket Tank with its 7.5 MB model) overwrite the portal's
 files; installing the WiFi Portal again restores them and its WiFi settings from the automatic backup.

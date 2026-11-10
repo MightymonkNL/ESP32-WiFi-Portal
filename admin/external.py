@@ -406,29 +406,8 @@ class ExternalModule(core.BaseModule):
         backup_flash(port, "esp32s3", path)
 
     def check_update(self):
-        if self.busy:
-            return
-        m = self.module
-
-        def work(_r):
-            return find_manifest(m.source.get("manifest") or m.source.get("url"))
-
-        def done(found):
-            new = str(found["manifest"].get("version") or "?")
-            if new == m.version:
-                self.set_status(f"{m.name} is up to date ({m.version}).", SUCCESS)
-                return
-            if not messagebox.askyesno("Update available",
-                                       f"{m.name} {new} is available (the Toolbox has {m.version}).\n\n"
-                                       "Download it now? Install it afterwards in the Firmware tab."):
-                return
-            found["url"] = m.source.get("url") or found["url"]
-            self.run_bg(lambda r: download(found, r, m.id),
-                        lambda _f: self.host.reload_project(m.id, f"Downloaded {m.name} {new}. Install it in the "
-                                                                  "Firmware tab."),
-                        f"Downloading {m.name} {new}…", progress_total=4 * 1024 * 1024)
-
-        self.run_bg(work, done, "Checking for an update…")
+        if not self.busy:
+            self.host.check_update_now(self.module)
 
     def remove(self):
         m = self.module
