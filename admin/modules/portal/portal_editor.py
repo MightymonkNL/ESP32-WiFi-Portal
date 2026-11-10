@@ -738,28 +738,37 @@ function pickFiles(multiple){
   });
 }
 function toBlob(canvas, type, q){ return new Promise(r => canvas.toBlob(r, type, q)); }
-async function prepare(file){
+// Gallery images: fit within GALLERY_SIDE × GALLERY_SIDE and keep the smallest encoding
+// (PNG first; JPEG only when it is smaller and the image has no transparency).
+const GALLERY_SIDE = 300;
+async function prepare(file, small){
   if (file.type === "image/gif") return file;           // keep animation
   let bmp; try { bmp = await createImageBitmap(file); } catch(e){ throw new Error(`${file.name} is not a readable image`); }
-  const scale = Math.min(1, MAX_SIDE / Math.max(bmp.width, bmp.height));
-  if (scale === 1 && file.size < 250 * 1024 && file.type !== "image/webp") return file;
-  const w = Math.round(bmp.width * scale), h = Math.round(bmp.height * scale);
+  const scale = Math.min(1, (small ? GALLERY_SIDE : MAX_SIDE) / Math.max(bmp.width, bmp.height));
+  if (!small && scale === 1 && file.size < 250 * 1024 && file.type !== "image/webp") return file;
+  const w = Math.max(1, Math.round(bmp.width * scale)), h = Math.max(1, Math.round(bmp.height * scale));
   const c = el("canvas"); c.width = w; c.height = h;
-  const ctx = c.getContext("2d"); ctx.drawImage(bmp, 0, 0, w, h);
+  const ctx = c.getContext("2d"); ctx.imageSmoothingQuality = "high"; ctx.drawImage(bmp, 0, 0, w, h);
   let alpha = false;
   if (file.type === "image/png" || file.type === "image/webp"){
     const d = ctx.getImageData(0, 0, w, h).data;
     for (let i = 3; i < d.length; i += 16) if (d[i] < 250){ alpha = true; break; }
   }
-  const out = alpha ? await toBlob(c, "image/png") : await toBlob(c, "image/jpeg", .84);
+  let out;
+  if (small){
+    out = await toBlob(c, "image/png");
+    if (!alpha){ const j = await toBlob(c, "image/jpeg", .8); if (j.size < out.size) out = j; }
+  } else {
+    out = alpha ? await toBlob(c, "image/png") : await toBlob(c, "image/jpeg", .84);
+  }
   return (scale === 1 && out.size >= file.size && file.type !== "image/webp") ? file : out;
 }
-async function uploadFiles(files){
+async function uploadFiles(files, small){
   const names = [], notes = [];
   for (const [i, f] of files.entries()){
     toast(`Processing image ${i + 1} of ${files.length}…`, 0);
     try {
-      const blob = await prepare(f);
+      const blob = await prepare(f, small);
       const j = await (await api("/api/image", {method:"POST", headers:{"Content-Type": blob.type || "application/octet-stream"}, body: blob})).json();
       if (j.error) throw new Error(j.error);
       sizes[j.name] = j.size; names.push(j.name);
@@ -843,7 +852,7 @@ function addBlock(type){
   openId = b.id; changed(true);
   if (type === "image" || type === "gallery"){
     pickFiles(type === "gallery").then(async fs => {
-      const names = await uploadFiles(fs);
+      const names = await uploadFiles(fs, type === "gallery");
       if (!names.length) return;
       if (type === "image") b.file = names[0]; else b.files = names.slice(0, MAX_GALLERY);
       changed(true);
@@ -906,7 +915,7 @@ function editor(b, sum){
       const add = async fs => {
         const room = MAX_GALLERY - b.files.length;
         if (room <= 0){ toast(`A gallery holds at most ${MAX_GALLERY} images.`); return; }
-        const n = await uploadFiles(fs.slice(0, room)); if (n.length){ b.files.push(...n); changed(true); }
+        const n = await uploadFiles(fs.slice(0, room), true); if (n.length){ b.files.push(...n); changed(true); }
       };
       const grid = el("div", {class:"gal"}, b.files.map((f, i) => el("div", {},
         el("img", {src: "/" + f, alt:""}),

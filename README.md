@@ -204,7 +204,8 @@ updates while you type (phone or desktop view). Changes are saved automatically;
 **Upload to ESP32** in the editor or the app to put the page on the board.
 
 Photos are resized to at most 1280 px before they are stored, so you can use photos straight
-from a phone. **Animated GIFs** stay animated: small ones are stored as they are, larger ones are
+from a phone. Gallery photos are made even smaller: at most 300×300 px, stored as PNG or JPEG,
+whichever is smaller (PNG when the image has transparency). **Animated GIFs** stay animated: small ones are stored as they are, larger ones are
 scaled down (all frames and timing kept, transparency too) until they are about 700 kB at most, so
 they fit on the board and load quickly on phones. The board has about 3 MB of space for pages and images; the editor shows how much
 your images use. With firmware 2.2 or newer, uploads skip images that are already on the board.
