@@ -25,7 +25,17 @@ from urllib.parse import urlparse
 # --------------------------------------------------------------------------- content model
 
 BLOCK_TYPES = ("heading", "text", "image", "gallery", "callout", "divider", "spacer")
-EDIT_KEYS = ("title", "footer", "bg", "card", "fg", "accent", "font", "layout", "width", "blocks")
+EDIT_KEYS = ("title", "footer", "bg", "card", "fg", "accent", "font", "layout", "width", "blocks", "warn")
+# Content warning shown before the page: round logo, text, Enter and Leave buttons
+WARN_DEFAULT = {
+    "on": False,
+    "logo": "",
+    "heading": "Content warning",
+    "html": "<p>This page contains content that some people may find upsetting.</p>",
+    "enter": "Enter",
+    "leave": "Leave",
+    "bye": "Goodbye! You are being disconnected from this network.",
+}
 FONTS = {
     "sans": '-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif',
     "serif": 'Georgia,Cambria,"Times New Roman",Times,serif',
@@ -161,6 +171,15 @@ def used_files(blocks):
     return out
 
 
+def content_files(content):
+    """Image files used by a portal: its blocks and the content-warning logo."""
+    out = used_files(content.get("blocks", []))
+    logo = (content.get("warn") or {}).get("logo", "")
+    if logo and logo not in out:
+        out.append(logo)
+    return out
+
+
 def _str(value, limit):
     return str(value if value is not None else "")[:limit]
 
@@ -209,6 +228,19 @@ def normalize_edit(src, base):
     out["layout"] = _pick(src.get("layout"), ("card", "flat"), "card")
     out["width"] = _pick(src.get("width"), tuple(WIDTHS), "normal")
     out["blocks"] = normalize_blocks(src.get("blocks", []))
+    out["warn"] = normalize_warn(src.get("warn", base.get("warn")))
+    return out
+
+
+def normalize_warn(w):
+    w = w if isinstance(w, dict) else {}
+    logo = w.get("logo", "")
+    out = {"on": bool(w.get("on", False)), "logo": logo if valid_file(logo) else ""}
+    for key, limit in (("heading", 200), ("enter", 40), ("leave", 40), ("bye", 300)):
+        out[key] = _str(w.get(key, WARN_DEFAULT[key]), limit)
+    out["html"] = sanitize_html(_str(w.get("html", WARN_DEFAULT["html"]), 5000))
+    for key in ("enter", "leave"):
+        out[key] = out[key].strip() or WARN_DEFAULT[key]
     return out
 
 
@@ -373,7 +405,7 @@ class EditorServer:
 
     def sizes(self, content):
         out = {}
-        for name in used_files(content.get("blocks", [])):
+        for name in content_files(content):
             p = os.path.join(self.assets_dir, name)
             if os.path.exists(p):
                 out[name] = os.path.getsize(p)
@@ -482,7 +514,8 @@ class _Handler(BaseHTTPRequestHandler):
                                     "portal": content.get("name", ""),
                                     "survey": bool(content.get("survey_on"))})
         if path == "/api/render":
-            return self._send(200, self.ed.render(), "text/html; charset=utf-8")
+            q = dict(p.split("=", 1) for p in u.query.split("&") if "=" in p)
+            return self._send(200, self.ed.render(q.get("warn") == "1"), "text/html; charset=utf-8")
         if path == "/api/status":
             return self._send(200, self.ed.get_status())
         return self._send(404, {"error": "not found"})
@@ -590,6 +623,9 @@ input[type=text]:focus,textarea:focus,select:focus,.rte:focus{border-color:var(-
 .chip:hover{border-color:var(--p);color:var(--p)}
 .chip .ico{width:24px;height:24px}
 .hint{font-size:12px;color:var(--m);margin:8px 0 0}
+.logo{display:flex;align-items:center;gap:14px}
+.logo img{width:84px;height:84px;border-radius:50%;object-fit:cover;background:var(--s1);flex:none}
+.logo .drop{flex:1}
 .empty{color:var(--m);text-align:center;padding:30px 10px;border:1.5px dashed var(--line);border-radius:12px}
 .colors{display:grid;grid-template-columns:1fr 1fr;gap:8px}
 .color{display:flex;align-items:center;gap:8px;background:var(--s2);border-radius:8px;padding:6px 8px}
@@ -622,7 +658,7 @@ footer{display:flex;gap:16px;align-items:center;padding:8px 20px;background:var(
 </header>
 <main>
   <aside>
-    <div class="tabs"><button data-p="content" class="on">Content</button><button data-p="style">Style</button></div>
+    <div class="tabs"><button data-p="content" class="on">Content</button><button data-p="style">Style</button><button data-p="warn">Warning</button></div>
     <div class="pane" id="p-content">
       <div id="blocks"></div>
       <div class="add">
@@ -632,6 +668,7 @@ footer{display:flex;gap:16px;align-items:center;padding:8px 20px;background:var(
       </div>
     </div>
     <div class="pane" id="p-style" hidden></div>
+    <div class="pane" id="p-warn" hidden></div>
   </aside>
   <section class="stage"><div class="frame phone" id="frame"><iframe id="pv" sandbox="allow-same-origin" title="Preview"></iframe></div></section>
 </main>
@@ -657,7 +694,7 @@ const PRESETS = [
 ];
 const MAX_GALLERY = 12, MAX_SIDE = 1280;
 
-let doc = null, rev = 0, sizes = {}, openId = null;
+let doc = null, rev = 0, sizes = {}, openId = null, tab = "content";
 let saveTimer = null, saving = false, dirty = false;
 const $ = s => document.querySelector(s);
 
@@ -694,7 +731,7 @@ async function load(){
   $("#survey-hint").textContent = j.survey
     ? "The survey (Survey tab in Portal Admin) is shown below your content."
     : "Tip: add a survey in the Survey tab of Portal Admin.";
-  renderBlocks(); renderStyle(); refreshPreview(); setState("Saved");
+  renderBlocks(); renderStyle(); renderWarn(); refreshPreview(); setState("Saved");
 }
 function setState(text, isDirty){ const s = $("#state"); s.textContent = text; s.classList.toggle("dirty", !!isDirty); }
 function changed(structural){
@@ -718,7 +755,7 @@ async function save(){
 }
 async function refreshPreview(){
   try {
-    const html = await (await api("/api/render")).text();
+    const html = await (await api("/api/render" + (tab === "warn" ? "?warn=1" : ""))).text();
     const f = $("#pv");
     let y = 0; try { y = f.contentWindow.scrollY; } catch(e){}
     f.onload = () => { try { f.contentWindow.scrollTo(0, y); } catch(e){} };
@@ -877,6 +914,24 @@ function seg(options, value, onpick){
   return s;
 }
 const ALIGN = [["left", "Left"], ["center", "Center"]];
+// rich-text field (toolbar + editable area) for obj[key]; returns [toolbar, area]
+function richText(obj, key, after){
+  const rte = el("div", {class:"rte", contenteditable:"true", html: obj[key]});
+  const sync = () => { obj[key] = rte.innerHTML; if (after) after(); changed(); };
+  rte.oninput = sync;
+  rte.onpaste = e => { e.preventDefault(); document.execCommand("insertText", false, e.clipboardData.getData("text/plain")); };
+  const cmd = (label, title, fn, style) => el("button", {title, style: style || "",
+    onmousedown: e => { e.preventDefault(); fn(); sync(); }}, label);
+  const bar = el("div", {class:"bar"},
+    cmd("B", "Bold", () => document.execCommand("bold"), "font-weight:800"),
+    cmd("I", "Italic", () => document.execCommand("italic"), "font-style:italic"),
+    cmd("U", "Underline", () => document.execCommand("underline"), "text-decoration:underline"),
+    cmd("• List", "Bullet list", () => document.execCommand("insertUnorderedList")),
+    cmd("1. List", "Numbered list", () => document.execCommand("insertOrderedList")),
+    cmd("Link", "Add link", () => { const u = prompt("Link address (https://…)", "https://"); if (u && u !== "https://") document.execCommand("createLink", false, u); }),
+    cmd("Clear", "Remove formatting", () => { document.execCommand("removeFormat"); document.execCommand("unlink"); }));
+  return [bar, rte];
+}
 function editor(b, sum){
   switch (b.type){
     case "heading": return [
@@ -884,23 +939,8 @@ function editor(b, sum){
       el("div", {class:"row"},
         el("div", {}, ...field("Size", seg([["l","Large"],["m","Medium"],["s","Small"]], b.size, v => { b.size = v; changed(); }))),
         el("div", {}, ...field("Align", seg(ALIGN, b.align, v => { b.align = v; changed(); }))))];
-    case "text": {
-      const rte = el("div", {class:"rte", contenteditable:"true", html: b.html});
-      const sync = () => { b.html = rte.innerHTML; sum.textContent = summary(b); changed(); };
-      rte.oninput = sync;
-      rte.onpaste = e => { e.preventDefault(); document.execCommand("insertText", false, e.clipboardData.getData("text/plain")); };
-      const cmd = (label, title, fn, style) => el("button", {title, style: style || "",
-        onmousedown: e => { e.preventDefault(); fn(); sync(); }}, label);
-      const bar = el("div", {class:"bar"},
-        cmd("B", "Bold", () => document.execCommand("bold"), "font-weight:800"),
-        cmd("I", "Italic", () => document.execCommand("italic"), "font-style:italic"),
-        cmd("U", "Underline", () => document.execCommand("underline"), "text-decoration:underline"),
-        cmd("• List", "Bullet list", () => document.execCommand("insertUnorderedList")),
-        cmd("1. List", "Numbered list", () => document.execCommand("insertOrderedList")),
-        cmd("Link", "Add link", () => { const u = prompt("Link address (https://…)", "https://"); if (u && u !== "https://") document.execCommand("createLink", false, u); }),
-        cmd("Clear", "Remove formatting", () => { document.execCommand("removeFormat"); document.execCommand("unlink"); }));
-      return [bar, rte, el("div", {}, ...field("Align", seg(ALIGN, b.align, v => { b.align = v; changed(); })))];
-    }
+    case "text": return [...richText(b, "html", () => sum.textContent = summary(b)),
+                         el("div", {}, ...field("Align", seg(ALIGN, b.align, v => { b.align = v; changed(); })))];
     case "image": {
       const set = async fs => { const n = await uploadFiles(fs.slice(0, 1)); if (n.length){ b.file = n[0]; changed(true); } };
       return [
@@ -959,6 +999,30 @@ function renderStyle(){
   );
 }
 
+// ------------------------------------------------------------------ warning pane
+function renderWarn(){
+  const p = $("#p-warn"); p.innerHTML = "";
+  const w = doc.warn;
+  const setLogo = async fs => { const n = await uploadFiles(fs.slice(0, 1), true); if (n.length){ w.logo = n[0]; renderWarn(); changed(); } };
+  const logo = w.logo
+    ? el("div", {class:"logo"}, el("img", {src: "/" + w.logo, alt:""}),
+        el("div", {}, el("button", {class:"btn sm", onclick: async () => setLogo(await pickFiles(false))}, "Replace logo…"), " ",
+          el("button", {class:"btn sm warn", onclick: () => { w.logo = ""; renderWarn(); changed(); }}, "Remove")))
+    : dropZone("Click or drop a logo here (shown as a circle)", false, setLogo);
+  p.append(
+    el("p", {class:"hint", style:"margin:0 0 6px"}, "Shown before the page. Visitors choose Enter to see the page or Leave to disconnect."),
+    ...field("Content warning", seg([[false, "Off"], [true, "On"]], w.on, v => { w.on = v; changed(); })),
+    ...field("Logo (optional)"), logo,
+    ...field("Heading (optional)", text(w, "heading", null, "e.g. Content warning")),
+    ...field("Text"), ...richText(w, "html"),
+    el("div", {class:"row"},
+      el("div", {}, ...field("Enter button", text(w, "enter", null, "Enter"))),
+      el("div", {}, ...field("Leave button", text(w, "leave", null, "Leave")))),
+    ...field("Message after Leave", text(w, "bye")),
+    el("p", {class:"hint"}, "Leave disconnects the phone with firmware 2.8 or newer; it then cannot rejoin for 2 minutes. "
+                          + "With older firmware the phone shows how to leave instead. In the preview, Enter and Leave can be clicked."));
+}
+
 // ------------------------------------------------------------------ status / upload
 let lastKind = "";
 async function poll(){
@@ -986,7 +1050,9 @@ for (const [type, t] of Object.entries(TYPES))
   $("#chips").append(el("button", {class:"chip", onclick: () => addBlock(type)}, el("span", {class:"ico"}, t.ico), t.label));
 document.querySelectorAll(".tabs button").forEach(b => b.onclick = () => {
   document.querySelectorAll(".tabs button").forEach(x => x.classList.toggle("on", x === b));
-  $("#p-content").hidden = b.dataset.p !== "content"; $("#p-style").hidden = b.dataset.p !== "style";
+  tab = b.dataset.p;
+  for (const p of ["content", "style", "warn"]) $("#p-" + p).hidden = tab !== p;
+  refreshPreview();
 });
 document.querySelectorAll("#view button").forEach(b => b.onclick = () => {
   document.querySelectorAll("#view button").forEach(x => x.classList.toggle("on", x === b));

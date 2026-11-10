@@ -394,22 +394,26 @@ static void handleSettingsPost() {
 
 // ---------------------------------------------------------------- survey answers
 
-// Voter key for the requesting device: based on its WiFi MAC address (looked up
-// via the DHCP lease of its IP); falls back to the IP address.
-static String currentVoterKey() {
+// WiFi MAC address of the requesting device, looked up via the DHCP lease of its IP
+static bool clientMac(uint8_t mac[6]) {
   IPAddress ip = server.client().remoteIP();
   wifi_sta_list_t sta;
-  if (esp_wifi_ap_get_sta_list(&sta) == ESP_OK && sta.num > 0) {
-    esp_netif_pair_mac_ip_t pairs[ESP_WIFI_MAX_CONN_NUM];
-    int n = sta.num;
-    for (int i = 0; i < n; i++) memcpy(pairs[i].mac, sta.sta[i].mac, 6);
-    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
-    if (netif && esp_netif_dhcps_get_clients_by_mac(netif, n, pairs) == ESP_OK) {
-      for (int i = 0; i < n; i++)
-        if (pairs[i].ip.addr == (uint32_t)ip) return surveyVoterKey(pairs[i].mac, 6);
-    }
-  }
-  uint32_t raw = (uint32_t)ip;
+  if (esp_wifi_ap_get_sta_list(&sta) != ESP_OK || sta.num == 0) return false;
+  esp_netif_pair_mac_ip_t pairs[ESP_WIFI_MAX_CONN_NUM];
+  int n = sta.num;
+  for (int i = 0; i < n; i++) memcpy(pairs[i].mac, sta.sta[i].mac, 6);
+  esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+  if (!netif || esp_netif_dhcps_get_clients_by_mac(netif, n, pairs) != ESP_OK) return false;
+  for (int i = 0; i < n; i++)
+    if (pairs[i].ip.addr == (uint32_t)ip) { memcpy(mac, pairs[i].mac, 6); return true; }
+  return false;
+}
+
+// Voter key for the requesting device: based on its WiFi MAC address; falls back to the IP address.
+static String currentVoterKey() {
+  uint8_t mac[6];
+  if (clientMac(mac)) return surveyVoterKey(mac, 6);
+  uint32_t raw = (uint32_t)server.client().remoteIP();
   return surveyVoterKey((const uint8_t *)&raw, sizeof(raw));
 }
 
@@ -447,6 +451,67 @@ static void handleAnswer() {
   server.sendHeader("Location", target, true);
   server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
   server.send(303, "text/plain", "");
+}
+
+// ---------------------------------------------------------------- content warning: Leave
+//
+// POST /leave (the Leave button of the content warning): the board disconnects that
+// device after LEAVE_DELAY_MS (so the page can show its goodbye message) and refuses it
+// for LEAVE_BLOCK_MS, so the phone does not rejoin and open the portal again right away.
+// The MAC addresses are kept in RAM only: never logged or stored, gone after a restart.
+
+#define LEAVE_DELAY_MS 1500UL
+#define LEAVE_BLOCK_MS 120000UL
+#define MAX_LEFT 8
+struct LeftDevice { uint8_t mac[6]; unsigned long since; bool used; };
+static LeftDevice leftDevices[MAX_LEFT];
+
+static void handleLeave() {
+  server.sendHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  uint8_t mac[6];
+  if (!clientMac(mac)) {
+    server.send(200, "application/json", "{\"ok\":false}");
+    return;
+  }
+  // same device again, else a free slot, else the oldest entry
+  int slot = -1, oldest = 0;
+  for (int i = 0; i < MAX_LEFT && slot < 0; i++)
+    if (leftDevices[i].used && memcmp(leftDevices[i].mac, mac, 6) == 0) slot = i;
+  for (int i = 0; i < MAX_LEFT && slot < 0; i++)
+    if (!leftDevices[i].used) slot = i;
+  if (slot < 0) {
+    for (int i = 1; i < MAX_LEFT; i++)
+      if (millis() - leftDevices[i].since > millis() - leftDevices[oldest].since) oldest = i;
+    slot = oldest;
+  }
+  memcpy(leftDevices[slot].mac, mac, 6);
+  leftDevices[slot].since = millis();
+  leftDevices[slot].used = true;
+  server.send(200, "application/json", "{\"ok\":true}");
+  Serial.println("[LEAVE] a device chose Leave and will be disconnected");
+}
+
+// Disconnects devices that chose Leave (also when they reconnect during the block time)
+static void checkLeftDevices() {
+  static unsigned long last = 0;
+  if (millis() - last < 500) return;
+  last = millis();
+  bool any = false;
+  for (int i = 0; i < MAX_LEFT; i++) {
+    if (leftDevices[i].used && millis() - leftDevices[i].since > LEAVE_BLOCK_MS) leftDevices[i].used = false;
+    any |= leftDevices[i].used;
+  }
+  if (!any || !apRunning) return;
+  wifi_sta_list_t sta;
+  if (esp_wifi_ap_get_sta_list(&sta) != ESP_OK) return;
+  for (int s = 0; s < sta.num; s++) {
+    for (int i = 0; i < MAX_LEFT; i++) {
+      if (!leftDevices[i].used || memcmp(leftDevices[i].mac, sta.sta[s].mac, 6) != 0) continue;
+      if (millis() - leftDevices[i].since < LEAVE_DELAY_MS) continue;
+      uint16_t aid = 0;
+      if (esp_wifi_ap_get_sta_aid(sta.sta[s].mac, &aid) == ESP_OK && aid) esp_wifi_deauth_sta(aid);
+    }
+  }
 }
 
 // ---------------------------------------------------------------- algemene handler
@@ -505,7 +570,7 @@ static String portalInfo() {
   PowerStatus ps = pmuStatus();
   char buf[320];
   snprintf(buf, sizeof(buf),
-           "ssid=%s open=%d clients=%d ip=%s lcd=%s ap=%d bat=%d chg=%d portal=%s essid=%s txp=%d",
+           "ssid=%s open=%d clients=%d ip=%s lcd=%s ap=%d bat=%d chg=%d portal=%s essid=%s txp=%d leave=1",
            toHex(apSsid).c_str(), apPass.isEmpty() ? 1 : 0,
            apRunning ? WiFi.softAPgetStationNum() : 0, apIP.toString().c_str(),
            displayDriver(), apRunning ? 1 : 0, ps.battery ? ps.percent : -1,
@@ -626,6 +691,7 @@ void setup() {
   server.collectHeaders(headerKeys, 1);
   server.on("/answer", HTTP_POST, handleAnswer);
   server.on("/voted", HTTP_GET, handleVoted);
+  server.on("/leave", HTTP_POST, handleLeave);
   server.on("/settings", HTTP_GET, handleSettingsGet);
   server.on("/settings", HTTP_POST, handleSettingsPost);
   // Al het overige via één handler (incl. /generate_204, /hotspot-detect.html,
@@ -700,6 +766,7 @@ void loop() {
   if (apRunning) {
     dnsServer.processNextRequest();
     server.handleClient();
+    checkLeftDevices();
   }
   checkResetButton();
   BoardLink::poll();

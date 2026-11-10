@@ -75,6 +75,7 @@ DEFAULT_CONTENT = {
     "survey_placeholder": "Type your answer here",
     "thanks_heading": "Thank you!",
     "thanks_text": "Your answer has been saved.",
+    "warn": dict(pe.WARN_DEFAULT),
 }
 
 
@@ -221,7 +222,7 @@ def save_store(store):
 def all_images(store):
     out = []
     for p in store["portals"]:
-        for n in pe.used_files(p["blocks"]):
+        for n in pe.content_files(p):
             if n not in out:
                 out.append(n)
     return out
@@ -284,7 +285,49 @@ TIME_SCRIPT = ("<script>(function(){var d=new Date(),p=function(n){return(n<10?'
                "})();</script>")
 
 
-def _page(c, inner, footer="", script=""):
+LEAVE_HINT = "Turn off WiFi or choose another network to leave."
+
+# Content warning: two hidden checkboxes switch between the warning, the page and the goodbye
+# message, so Enter and Leave also work without JavaScript (and in the editor preview).
+# The script remembers Enter for this browser tab (sessionStorage, nothing leaves the phone),
+# makes the labels keyboard buttons, and asks the board to disconnect this device on Leave
+# (firmware 2.8+; older firmware answers with the page itself, then the hint is shown).
+WARN_SCRIPT = ("<script>(function(){var ok=document.getElementById('cw-ok'),no=document.getElementById('cw-no');"
+               "if(!ok)return;try{if(sessionStorage.getItem('cw')==='1')ok.checked=true;}catch(e){}"
+               "ok.addEventListener('change',function(){try{sessionStorage.setItem('cw','1');}catch(e){}"
+               "window.scrollTo(0,0);});"
+               "var l=document.querySelectorAll('.cw-btns label');for(var i=0;i<l.length;i++)"
+               "l[i].addEventListener('keydown',function(e){if(e.key==='Enter'||e.key===' '){e.preventDefault();"
+               "this.click();}});"
+               "no.addEventListener('change',function(){"
+               "fetch('/leave',{method:'POST',cache:'no-store'}).then(function(r){return r.json();})"
+               ".then(function(j){if(!j.ok)throw 0;}).catch(function(){"
+               "document.getElementById('cw-hint').style.display='block';});});"
+               "})();</script>")
+
+
+def render_warn(c):
+    """The content warning in front of the page, or "" when it is off."""
+    w = c.get("warn") or {}
+    if not w.get("on"):
+        return ""
+    esc = html.escape
+    logo = f'<img class="cw-logo" src="{esc(w["logo"])}" alt="">' if w.get("logo") else ""
+    head = f'<h1 id="cw-h">{esc(w["heading"])}</h1>' if w.get("heading", "").strip() else ""
+    text = f'<div class="rt">{w["html"]}</div>' if w.get("html", "").strip() else ""
+    bye = esc(w.get("bye", "")).replace("\n", "<br>")
+    labelled = ' aria-labelledby="cw-h"' if head else ""
+    return (f'<input type="checkbox" id="cw-ok" class="cw-cb" aria-hidden="true" tabindex="-1">'
+            f'<input type="checkbox" id="cw-no" class="cw-cb" aria-hidden="true" tabindex="-1">'
+            f'<div class="cw" role="dialog" aria-modal="true"{labelled}>'
+            f'<div class="card">{logo}{head}{text}'
+            f'<div class="cw-btns"><label for="cw-ok" class="cw-in" role="button" tabindex="0">{esc(w["enter"])}</label>'
+            f'<label for="cw-no" class="cw-out" role="button" tabindex="0">{esc(w["leave"])}</label></div>'
+            f'<div class="cw-bye" role="status"><p>{bye}</p><p class="cw-hint" id="cw-hint">{LEAVE_HINT}</p></div>'
+            f'</div></div>')
+
+
+def _page(c, inner, footer="", script="", warn=""):
     esc = html.escape
     acc, on_acc = c["accent"], on_color(c["accent"])
     font = pe.FONTS.get(c.get("font"), pe.FONTS["sans"])
@@ -325,9 +368,25 @@ color:inherit;background:rgba(127,127,127,.12);border:1px solid rgba(127,127,127
 font-size:17px;font-weight:600;cursor:pointer}}
 .privacy{{font-size:12px;opacity:.6;margin:14px 0 0 !important}}
 .back{{display:inline-block;margin-top:8px;color:{acc};font-weight:600}}
+.cw-cb{{position:absolute;width:1px;height:1px;opacity:0;pointer-events:none}}
+#cw-ok:checked~.cw{{display:none}}#cw-ok:not(:checked)~main{{display:none}}
+.cw{{max-width:460px;margin:0 auto;padding:40px 16px;min-height:100vh;display:flex;flex-direction:column;justify-content:center}}
+.cw .card{{text-align:center}}
+.cw-logo{{display:block;width:132px;height:132px;margin:0 auto 20px;border-radius:50%;object-fit:cover;
+box-shadow:0 2px 10px rgba(0,0,0,.25)}}
+.cw h1{{font-size:24px}}
+.cw-btns{{display:flex;gap:10px;margin-top:24px}}
+.cw-btns label{{flex:1;min-height:50px;padding:12px;border-radius:12px;font-size:17px;font-weight:600;cursor:pointer;
+display:flex;align-items:center;justify-content:center;user-select:none}}
+.cw-in{{background:{acc};color:{on_acc}}}
+.cw-out{{border:2px solid rgba(127,127,127,.45)}}
+.cw-btns label:focus-visible{{outline:3px solid {acc};outline-offset:2px}}
+.cw-bye,.cw-hint{{display:none}}.cw-bye{{margin-top:22px;font-weight:600}}.cw-hint{{font-weight:400;opacity:.7;font-size:14px}}
+#cw-no:checked~.cw .cw-btns{{display:none}}#cw-no:checked~.cw .cw-bye{{display:block}}
 </style>
 </head>
 <body>
+{warn}
 <main>
 <div class="card">
 {inner}
@@ -364,12 +423,15 @@ def render_survey(c):
             f'<p class="privacy">{privacy}</p></form>')
 
 
-def render_html(c):
-    """Landing page; images are referenced by their plain file name (same folder)."""
+def render_html(c, warn=True):
+    """Landing page; images are referenced by their plain file name (same folder).
+    warn=False leaves out the content warning (editor preview while editing the page)."""
     esc = html.escape
     footer = f"<footer>{esc(c['footer'])}</footer>" if c.get("footer", "").strip() else ""
     survey = render_survey(c) if c.get("survey_on") else ""
-    return _page(c, f"{pe.render_blocks(c)}\n{survey}", footer, TIME_SCRIPT if survey else "")
+    cw = render_warn(c) if warn else ""
+    script = (TIME_SCRIPT if survey else "") + (WARN_SCRIPT if cw else "")
+    return _page(c, f"{pe.render_blocks(c)}\n{survey}", footer, script, cw)
 
 
 def render_thanks(c):
@@ -1227,12 +1289,14 @@ class Module(core.BaseModule):
         with self.lock:
             c = copy.deepcopy(self.content)
         blocks = c["blocks"]
-        files = pe.used_files(blocks)
+        files = pe.content_files(c)
         size = sum(os.path.getsize(asset_path(n)) for n in files if os.path.exists(asset_path(n)))
         parts = [f"{len(blocks)} block{'s' if len(blocks) != 1 else ''}",
                  f"{len(files)} image{'s' if len(files) != 1 else ''}" + (f" ({size / 1024:.0f} kB)" if files else "")]
         if c.get("survey_on"):
             parts.append("survey on")
+        if c.get("warn", {}).get("on"):
+            parts.append("content warning on")
         heading = next((b["text"] for b in blocks if b["type"] == "heading" and b["text"].strip()), "")
         self.page_summary.configure(text=(f"“{heading}”   ·   " if heading else "") + "   ·   ".join(parts),
                                     wraplength=420, justify="left")
@@ -1258,9 +1322,9 @@ class Module(core.BaseModule):
         self.calls.put(self._update_summary)
         return rev
 
-    def _editor_render(self):
+    def _editor_render(self, warn=True):
         with self.lock:
-            return render_html(copy.deepcopy(self.content))
+            return render_html(copy.deepcopy(self.content), warn)
 
     def _editor_status(self):
         with self.lock:
@@ -1301,7 +1365,7 @@ class Module(core.BaseModule):
         folder = os.path.join(tempfile.gettempdir(), "esp32-portal-preview")
         shutil.rmtree(folder, ignore_errors=True)
         os.makedirs(folder, exist_ok=True)
-        for name in pe.used_files(c["blocks"]):
+        for name in pe.content_files(c):
             if os.path.exists(asset_path(name)):
                 shutil.copyfile(asset_path(name), os.path.join(folder, name))
         out = os.path.join(folder, "index.html")
@@ -1402,8 +1466,11 @@ class Module(core.BaseModule):
                 used_kb = int(vals.get("used", 0)) // 1024
                 total_kb = int(vals.get("total", 0)) // 1024
             n = len(store["portals"])
+            note = ""
+            if info.get("leave") != "1" and any(c["warn"]["on"] for c in store["portals"]):
+                note = " Leave only disconnects phones with firmware 2.8 or newer (Firmware tab)."
             self.set_status(f"Uploaded {n} portal{'s' if n != 1 else ''} ({total / 1024:.0f} kB, "
-                            f"{len(used)} image(s)). Storage: {used_kb} of {total_kb} kB in use.", SUCCESS)
+                            f"{len(used)} image(s)). Storage: {used_kb} of {total_kb} kB in use." + note, SUCCESS)
             if then:
                 then()
 

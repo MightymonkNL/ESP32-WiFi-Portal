@@ -210,6 +210,13 @@ scaled down (all frames and timing kept, transparency too) until they are about 
 they fit on the board and load quickly on phones. The board has about 3 MB of space for pages and images; the editor shows how much
 your images use. With firmware 2.2 or newer, uploads skip images that are already on the board.
 
+**Content warning** (the editor's **Warning** tab, per portal): a screen in front of the page with an
+optional round logo, a heading, text and two buttons. **Enter** shows the page (remembered while
+that browser tab stays open); **Leave** shows a goodbye message. With firmware 2.8 or newer the board
+then disconnects that phone and refuses it for 2 minutes, so it does not rejoin and open the portal
+again. Older firmware cannot disconnect it, so the page tells the visitor to turn off WiFi. The
+preview shows the warning while the Warning tab is open.
+
 When the app starts it downloads the page, survey settings and images from the board (stored there
 on every upload, firmware 2.3 or newer). On a new PC you only need the exe and the board. If this PC has
 changes that were not uploaded yet, the app asks which version to keep and saves a backup of the other.
@@ -230,6 +237,8 @@ Each answer is stored as one line in `/responses.csv` on the board:
 
 - *time* is the visitor's phone clock; *device* is a coarse type such as `iPhone (iOS 18)` or `Android 15 (Samsung)`.
 - No IP addresses, MAC addresses or names are written to the log.
+- **Leave** (content warning): the board keeps the MAC addresses of phones that chose Leave in RAM
+  only, for 2 minutes, to keep them off the network. They are never logged or stored, and a restart clears them.
 - **One answer per device per question:** the board keeps a salted SHA-256 hash of the device's
   MAC address in `/voters.txt` (the random salt never leaves the board). This file is never exported;
   **Clear log** deletes it together with the answers. A new question starts with an empty list.
@@ -290,7 +299,7 @@ has them); the others are the portal's own.
 
 | Command | Reply |
 |---|---|
-| `INFO` | `@INFO app=portal fw=<version> mac=<mac> ssid=<hex> open=<0/1> clients=<n> ip=<ip> lcd=<SH8601/CO5300/none> ap=<0/1> bat=<0-100/-1> chg=<0/1> portal=<id> essid=<hex> txp=<25-100>` |
+| `INFO` | `@INFO app=portal fw=<version> mac=<mac> ssid=<hex> open=<0/1> clients=<n> ip=<ip> lcd=<SH8601/CO5300/none> ap=<0/1> bat=<0-100/-1> chg=<0/1> portal=<id> essid=<hex> txp=<25-100> leave=1` (`leave=1`: firmware 2.8+) |
 | `REBOOT` | `@OK` + restart |
 | `FLIST` | `@FLIST <name>:<size> ...` |
 | `PORTAL <id>` | Activate a portal |
