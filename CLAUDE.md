@@ -21,8 +21,7 @@ Two parts that work together:
    installing and switching firmware, backups, and each project's own UI (the portal's page editor,
    survey results and so on).
 
-The user is a teacher or school staff member. The board is used in classrooms and at events
-such as open days. Communicate with the user in **Dutch**. Code, comments, UI text, docs and commit
+Communicate with the user in **Dutch**. Code, comments, UI text, docs and commit
 messages are in **English** (a few older comments in `src/main.cpp` are still Dutch).
 
 ## Repository layout
