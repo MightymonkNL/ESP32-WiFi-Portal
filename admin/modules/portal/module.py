@@ -1693,24 +1693,38 @@ class Module(core.BaseModule):
 
         self.run_bg(work, done, "Reading results…")
 
+    @staticmethod
+    def _portal_id_of(row):
+        """Portal id of a log row (survey ids start with the portal id), "" before portals."""
+        sid = row.get("survey_id") or ""
+        return sid.split("-")[0] if "-" in sid else ""
+
+    def _portal_label(self, portal):
+        """Portal name, with its id added when another portal has the same name."""
+        same = sum(1 for q in self.store["portals"] if q["name"] == portal["name"])
+        return f"{portal['name']} ({portal['id']})" if same > 1 else portal["name"]
+
     def _portal_of(self, row):
-        """Portal name for a log row (survey ids start with the portal id)."""
-        pid = (row.get("survey_id") or "").split("-")[0]
-        return next((q["name"] for q in self.store["portals"] if q["id"] == pid),
-                    "(deleted portal)" if "-" in (row.get("survey_id") or "") else "(before portals)")
+        """Portal name for a log row."""
+        pid = self._portal_id_of(row)
+        return next((self._portal_label(q) for q in self.store["portals"] if q["id"] == pid),
+                    "(deleted portal)" if pid else "(before portals)")
 
     def _show_results(self):
-        names = ["All portals"] + [q["name"] for q in self.store["portals"]]
-        self.filter_box["values"] = names
-        if self.results_filter.get() not in names:
+        # The filter works on portal ids, so portals with the same name never mix
+        choices = {"All portals": None}
+        for q in self.store["portals"]:
+            choices[self._portal_label(q)] = q["id"]
+        self.filter_box["values"] = list(choices)
+        if self.results_filter.get() not in choices:
             self.results_filter.set("All portals")
-        chosen = self.results_filter.get()
-        rows = [r for r in self.log_rows if chosen == "All portals" or self._portal_of(r) == chosen]
+        chosen = choices[self.results_filter.get()]
+        rows = [r for r in self.log_rows if chosen is None or self._portal_id_of(r) == chosen]
         self.tree.delete(*self.tree.get_children())
         for r in reversed(rows):
             self.tree.insert("", "end", values=(r.get("time", ""), self._portal_of(r), r.get("device", ""),
                                                 r.get("question", ""), r.get("answer", "")))
-        portal = next((q for q in self.store["portals"] if q["name"] == chosen), self.content)
+        portal = next((q for q in self.store["portals"] if q["id"] == chosen), self.content)
         self._summarise(rows, portal)
 
     def _show_answer(self, _event=None):
