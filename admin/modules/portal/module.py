@@ -1304,13 +1304,15 @@ class Module(core.BaseModule):
         blocks = c["blocks"]
         files = pe.content_files(c)
         size = sum(os.path.getsize(asset_path(n)) for n in files if os.path.exists(asset_path(n)))
-        parts = [f"{len(blocks)} block{'s' if len(blocks) != 1 else ''}",
+        hidden = sum(1 for b in blocks if b.get("hidden"))
+        parts = [f"{len(blocks)} block{'s' if len(blocks) != 1 else ''}" + (f" ({hidden} hidden)" if hidden else ""),
                  f"{len(files)} image{'s' if len(files) != 1 else ''}" + (f" ({size / 1024:.0f} kB)" if files else "")]
         if c.get("survey_on"):
             parts.append("survey on")
         if c.get("warn", {}).get("on"):
             parts.append("content warning on")
-        heading = next((b["text"] for b in blocks if b["type"] == "heading" and b["text"].strip()), "")
+        heading = next((b["text"] for b in blocks if b["type"] == "heading" and b["text"].strip()
+                        and not b.get("hidden")), "")
         self.page_summary.configure(text=(f"“{heading}”   ·   " if heading else "") + "   ·   ".join(parts),
                                     wraplength=420, justify="left")
         for w in self.page_colors.winfo_children():

@@ -212,6 +212,8 @@ def normalize_blocks(blocks):
             nb.update(text=_str(b.get("text"), 2000), tone=_pick(b.get("tone"), ("accent", "orange", "green"), "accent"))
         elif t == "spacer":
             nb.update(size=_pick(b.get("size"), ("s", "m", "l"), "m"))
+        if b.get("hidden") is True:      # kept in the editor, left out of the page
+            nb["hidden"] = True
         out.append(nb)
     return out
 
@@ -354,6 +356,8 @@ def render_blocks(c):
     esc = html.escape
     parts = []
     for b in c.get("blocks", []):
+        if b.get("hidden"):
+            continue
         t = b["type"]
         al = " al-c" if b.get("align") == "center" else ""
         if t == "heading" and b["text"].strip():
@@ -597,6 +601,10 @@ aside{width:420px;flex:none;display:flex;flex-direction:column;background:var(--
 .tools button{border:0;background:none;width:26px;height:26px;border-radius:6px;cursor:pointer;color:var(--m);font-size:13px}
 .tools button:hover{background:var(--s3);color:var(--t)}
 .tools button.del:hover{color:var(--o)}
+.tools button.eye{display:grid;place-items:center}.tools button.eye svg{width:16px;height:16px}
+.card.off .ico,.card.off .what>span{opacity:.4}.card.off .what>span{text-decoration:line-through}
+.card.off .tools{opacity:1}.card.off .tools button.eye{color:var(--o)}
+.offtag{font-size:10px;font-weight:700;color:var(--o);margin-left:6px;text-transform:uppercase;letter-spacing:.04em}
 .body{padding:2px 12px 14px;display:none}
 .card.open .body{display:block}
 label.f{display:block;font-size:12px;color:var(--m);font-weight:600;margin:10px 0 5px}
@@ -839,20 +847,25 @@ function summary(b){
   }
   return "";
 }
+const EYE = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12z"/><circle cx="12" cy="12" r="3"/></svg>';
+const EYE_OFF = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17 17 0 0 1-2.2 3.1M6.6 6.6C3.9 8.4 2 12 2 12s3.5 7 10 7c1.9 0 3.6-.6 5-1.5"/><path d="M9.9 9.9a3 3 0 0 0 4.2 4.2"/><path d="M2 2l20 20"/></svg>';
 let dragFrom = -1;
 function renderBlocks(){
   const box = $("#blocks"); box.innerHTML = "";
   if (!doc.blocks.length) box.append(el("div", {class:"empty"}, "The page is empty. Add a block below."));
   doc.blocks.forEach((b, i) => {
-    const card = el("div", {class: "card" + (b.id === openId ? " open" : ""), "data-i": i});
+    const card = el("div", {class: "card" + (b.id === openId ? " open" : "") + (b.hidden ? " off" : ""), "data-i": i});
     const grip = el("span", {class:"grip", title:"Drag to move"}, "⋮⋮");
     grip.onmousedown = () => card.draggable = true;
     const sum = el("span", {}, summary(b));
     const tool = (txt, title, fn, cls) => el("button", {title, class: cls || "", onclick: e => { e.stopPropagation(); fn(); }}, txt);
     const head = el("div", {class:"head", onclick: () => { openId = openId === b.id ? null : b.id; renderBlocks(); }},
       grip, el("span", {class:"ico"}, TYPES[b.type].ico),
-      el("div", {class:"what"}, el("b", {}, TYPES[b.type].label), sum),
+      el("div", {class:"what"}, el("b", {}, TYPES[b.type].label, b.hidden ? el("span", {class:"offtag"}, "Hidden") : null), sum),
       el("div", {class:"tools"},
+        el("button", {class:"eye", title: b.hidden ? "Hidden on the portal: click to show" : "Visible on the portal: click to hide",
+                      "aria-pressed": b.hidden ? "true" : "false", html: b.hidden ? EYE_OFF : EYE,
+                      onclick: e => { e.stopPropagation(); if (b.hidden) delete b.hidden; else b.hidden = true; changed(true); }}),
         tool("↑", "Move up", () => move(i, i - 1)),
         tool("↓", "Move down", () => move(i, i + 2)),
         tool("⧉", "Duplicate", () => { const c = JSON.parse(JSON.stringify(b)); c.id = uid(); doc.blocks.splice(i + 1, 0, c); openId = c.id; changed(true); }),

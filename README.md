@@ -198,7 +198,10 @@ need firmware 2.5 or newer.
 | Highlight | coloured box for important information |
 | Divider / Space | structure the page |
 
-Drag blocks by their handle (⋮⋮) or use the arrows to reorder them. The **Style** tab has
+Drag blocks by their handle (⋮⋮) or use the arrows to reorder them. The eye icon hides a block
+from the portal without deleting it (click it again to show the block); hidden blocks stay in
+the editor, dimmed and marked *Hidden*. Their images are still uploaded, so showing a block
+again only needs a new upload of the pages. The **Style** tab has
 colour themes, colours, font, layout (card or full page) and width. The preview on the right
 updates while you type (phone or desktop view). Changes are saved automatically; click
 **Upload to ESP32** in the editor or the app to put the page on the board.
