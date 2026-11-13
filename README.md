@@ -326,6 +326,7 @@ has them); the others are the portal's own.
 | "Firmware not built yet" in Install project | Run `build_exe.bat` or `python admin\build_modules.py` |
 | Board not recognised / installing fails | Download mode (hold BOOT, press RESET, release BOOT), then **Install project…** again |
 | "Incorrect padding" or "damaged data on the USB line" when portals are downloaded from the board | Update the Toolbox: it now reads damaged blocks again. Still failing: close other serial programs, use another USB cable or port |
+| Toolbox says the firmware on the ESP32 is newer | The board was updated from another PC. Use the latest Toolbox package there too; installing the older firmware is a downgrade |
 | Windows warns when starting the exe | The exe is not code-signed: *More info → Run anyway* |
 
 ## License

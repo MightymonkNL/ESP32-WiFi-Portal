@@ -204,8 +204,11 @@ class Toolbox(tk.Tk):
             on = "\u25cf On the ESP32  \u00b7  " if b and b.get("app") == m.id else ""
             return f"{on}Update available: {online}", SECONDARY
         if b and b.get("app") == m.id:
-            if m.firmware_files() and b.get("fw") and b["fw"] != m.version:
+            state = self._fw_state(m)
+            if state == "update":
                 return f"● On the ESP32  ·  update {b['fw']} → {m.version}", SECONDARY
+            if state == "newer":
+                return f"● On the ESP32  ·  {b['fw']} is newer than this Toolbox", SECONDARY
             return "● On the ESP32", SUCCESS
         if not m.firmware_files():
             return "Firmware not built yet", MUTED
@@ -243,6 +246,16 @@ class Toolbox(tk.Tk):
     def _runs(self, module_id):
         return bool(self.board and self.board.get("app") == module_id)
 
+    def _fw_state(self, m):
+        """Firmware of project m on the board compared with the Toolbox: "same", "update" (the
+        Toolbox has a newer one, or a different one that cannot be compared), "newer" (the board
+        has a newer one: installing would be a downgrade) or None (not on the board, or not built)."""
+        b = self.board
+        if not (b and b.get("app") == m.id and b.get("fw") and m.firmware_files()):
+            return None
+        cmp = core.compare_versions(b["fw"], m.version)
+        return "same" if cmp == 0 else "newer" if cmp == 1 else "update"
+
     def _update_banner(self):
         if self.view is None:
             return
@@ -257,9 +270,12 @@ class Toolbox(tk.Tk):
         elif b["app"] != m.id:
             text = f"On the ESP32 now: {self._app_name(b['app'])} {b.get('fw') or ''}".rstrip() + "."
             button = f"Install {m.name}"
-        elif m.firmware_files() and b.get("fw") and b["fw"] != m.version:
+        elif self._fw_state(m) == "update":
             text = f"Firmware {b['fw']} on the ESP32; the Toolbox has {m.version}."
             button = f"Update to {m.version}"
+        elif self._fw_state(m) == "newer":
+            text = (f"Firmware {b['fw']} on the ESP32 is newer than this Toolbox ({m.version}). "
+                    "Get the latest Toolbox package; do not install the older firmware.")
         if button and not m.firmware_files():
             button = None
             text += " Its firmware is not built yet (build_modules.bat)."
@@ -360,7 +376,11 @@ class Toolbox(tk.Tk):
             label = f"Install {m.name} on the ESP32"
             state = (f"Installing replaces {self._app_name(b['app'])} on the ESP32 (it is backed up first)."
                      if b.get("app") else "")
-        elif b.get("fw") != m.version:
+        elif self._fw_state(m) == "newer":
+            label, color, primary = f"Install older {m.version}", SECONDARY, False
+            state = (f"The ESP32 has newer firmware ({b.get('fw')}) than this Toolbox ({m.version}). "
+                     "Get the latest Toolbox package instead; installing would be a downgrade.")
+        elif self._fw_state(m) == "update":
             label, state, color = f"Update to {m.version}", f"Update available: {b.get('fw')} → {m.version}.", \
                 SECONDARY
         else:
@@ -600,7 +620,12 @@ class Toolbox(tk.Tk):
             steps.append(f"Put the last settings of “{module.name}” back, if there is a backup for this ESP32")
         text = f"Install “{module.name}” on the ESP32 on {port}?\n\n" + \
             "\n".join(f"{i}. {s}" for i, s in enumerate(steps, 1))
-        if not messagebox.askyesno("Install project", text):
+        if self._fw_state(module) == "newer":
+            text = (f"The ESP32 has {module.name} {b.get('fw')}, which is NEWER than the firmware in this "
+                    f"Toolbox ({module.version}). Installing goes back to the older version and can "
+                    "remove features. Get the latest Toolbox package instead.\n\n" + text)
+        if not messagebox.askyesno("Install project", text,
+                                   icon="warning" if self._fw_state(module) == "newer" else "question"):
             return
 
         if self.view is not None:

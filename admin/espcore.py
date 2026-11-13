@@ -64,6 +64,20 @@ def save_settings(settings):
         json.dump(settings, f, indent=2)
 
 
+def compare_versions(a, b):
+    """-1, 0 or 1 for version a older than, equal to or newer than b ("2.10" > "2.9").
+    None when they differ but cannot be compared (not plain numbers)."""
+    a, b = str(a or "").strip().lstrip("vV"), str(b or "").strip().lstrip("vV")
+    if a == b:
+        return 0
+    if not re.fullmatch(r"\d+(\.\d+)*", a) or not re.fullmatch(r"\d+(\.\d+)*", b):
+        return None
+    pa, pb = [int(x) for x in a.split(".")], [int(x) for x in b.split(".")]
+    n = max(len(pa), len(pb))
+    pa, pb = pa + [0] * (n - len(pa)), pb + [0] * (n - len(pb))
+    return (pa > pb) - (pa < pb)
+
+
 def norm_mac(mac):
     mac = (mac or "").strip().lower().replace("-", ":")
     return mac if re.fullmatch(r"[0-9a-f]{2}(:[0-9a-f]{2}){5}", mac) else None
