@@ -219,6 +219,16 @@ def save_store(store):
     os.replace(tmp, CONTENT_FILE)
 
 
+IMAGE_HASH_RE = re.compile(r"^img-([0-9a-f]{10})\.")
+
+
+def image_matches_name(name, data):
+    """True when the data fits the image's content-hash name (img-<sha1[:10]>.ext); other
+    names cannot be checked and count as a match."""
+    m = IMAGE_HASH_RE.match(name)
+    return not m or hashlib.sha1(data).hexdigest()[:10] == m.group(1)
+
+
 def all_images(store):
     out = []
     for p in store["portals"]:
@@ -1025,10 +1035,13 @@ class Module(core.BaseModule):
             with Board(port) as b:
                 for name in missing:
                     start = got
-                    blob = b.get_file("/" + name, lambda n: report(start + n))
+                    for _attempt in range(3):     # content-hash names: a bad copy is read again
+                        blob = b.get_file("/" + name, lambda n: report(start + n))
+                        if not blob or image_matches_name(name, blob):
+                            break
                     if not blob:
                         raise FileNotFoundError(f"Image {name} is missing on the board.")
-                    if not pe.image_ext(blob):
+                    if not pe.image_ext(blob) or not image_matches_name(name, blob):
                         raise ValueError(f"Image {name} on the board is damaged.")
                     os.makedirs(ASSETS_DIR, exist_ok=True)
                     with open(asset_path(name), "wb") as f:

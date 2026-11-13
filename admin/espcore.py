@@ -266,18 +266,48 @@ class Board:
                 files[name.lstrip("/")] = int(size or 0)
         return files
 
+    def _resync(self):
+        """Drops whatever is still underway on the line (rest of a damaged reply)."""
+        time.sleep(0.3)
+        self.s.reset_input_buffer()
+        self.buf = b""
+
     def get_file(self, path, progress=None):
-        """Contents of a file on the board (b"" when it does not exist)."""
+        """Contents of a file on the board (b"" when it does not exist).
+
+        A USB serial line can lose or mix up bytes (another program on the port, a log line from
+        the firmware in the middle of a reply). Every block is therefore checked: a block that is
+        not valid base64, or a short block that turns out not to be the last one, is read again."""
         data = b""
+        short = None        # offset of the last short block: it must be followed by EOF
+        retries = 0
         while True:
             reply = self.cmd(f"FREAD {path} {len(data)}")
             if reply.startswith("EOF"):
                 return data
             if not reply.startswith("DATA"):
                 raise RuntimeError(reply[4:] if reply.startswith("ERR") else reply)
-            chunk = base64.b64decode(reply[5:].strip())
+            if short is not None:            # the short block was cut off: read it again
+                data, chunk = data[:short], None
+            else:
+                try:
+                    chunk = base64.b64decode(reply[5:].strip(), validate=True)
+                except ValueError:           # binascii.Error ("Incorrect padding") is a ValueError
+                    chunk = None
+                if chunk is not None and len(chunk) > CHUNK:   # two replies run together
+                    chunk = None
+            if chunk is None:
+                retries += 1
+                if retries > 8:
+                    raise RuntimeError(f"Reading {path} from the board keeps failing (damaged data on "
+                                       "the USB line). Close other programs that use the port and try again.")
+                short = None
+                self._resync()
+                continue
             if not chunk:
                 return data
+            if len(chunk) < CHUNK:
+                short = len(data)
             data += chunk
             if progress:
                 progress(len(data))

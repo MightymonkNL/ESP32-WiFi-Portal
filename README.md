@@ -325,6 +325,7 @@ has them); the others are the portal's own.
 | App says "Cannot open the port" | Close the PlatformIO serial monitor or other serial programs |
 | "Firmware not built yet" in Install project | Run `build_exe.bat` or `python admin\build_modules.py` |
 | Board not recognised / installing fails | Download mode (hold BOOT, press RESET, release BOOT), then **Install project…** again |
+| "Incorrect padding" or "damaged data on the USB line" when portals are downloaded from the board | Update the Toolbox: it now reads damaged blocks again. Still failing: close other serial programs, use another USB cable or port |
 | Windows warns when starting the exe | The exe is not code-signed: *More info → Run anyway* |
 
 ## License
